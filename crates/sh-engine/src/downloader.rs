@@ -100,6 +100,7 @@ impl DownloaderClient {
     }
 
     /// 以字节流添加种子（qB multipart / TR metainfo base64），带 info_hash 幂等检查。
+    /// save_path：辅种种子落盘目录（源种子 save_path；None = 下载器默认目录）。
     pub async fn add_torrent_bytes(
         &mut self,
         torrent_bytes: &[u8],
@@ -107,6 +108,7 @@ impl DownloaderClient {
         auto_start: bool,
         tag: Option<&str>,
         info_hash: &str,
+        save_path: Option<&str>,
     ) -> bool {
         match self.conn.kind {
             DownloaderKind::Qbittorrent => {
@@ -134,6 +136,11 @@ impl DownloaderClient {
                 if let Some(tag) = tag {
                     if !tag.is_empty() {
                         form = form.text("tags", tag.to_string());
+                    }
+                }
+                if let Some(path) = save_path {
+                    if !path.is_empty() {
+                        form = form.text("savepath", path.to_string());
                     }
                 }
                 let mut req = self.http.post(&url).multipart(form);
@@ -293,6 +300,26 @@ impl DownloaderClient {
             .get("state")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// qB 查询种子保存路径与状态（源种子状态前置检查 + save_path 传递用）。
+    /// 对齐 Python get_torrent_info：返回 (save_path, state)，种子不存在返回 None。
+    pub async fn qb_torrent_info(&self, info_hash: &str) -> Option<(String, String)> {
+        let url = format!("{}/api/v2/torrents/info", self.base_url());
+        let mut req = self.http.get(&url).query(&[("hashes", info_hash)]);
+        if let Some((name, value)) = self.qb_auth() {
+            req = req.header(name, value);
+        }
+        let resp = req.send().await.ok()?;
+        let arr: Value = resp.json().await.ok()?;
+        let t = arr.as_array()?.first()?;
+        let save_path = t
+            .get("save_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let state = t.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Some((save_path, state))
     }
 
     /// TR：torrent-add（paused = !auto_start）。

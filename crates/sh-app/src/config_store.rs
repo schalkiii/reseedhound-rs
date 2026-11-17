@@ -381,11 +381,6 @@ impl ConfigStore {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn config_exists(&self) -> bool {
-        self.config_path.exists() && self.sites_path.exists()
-    }
-
     /// 读取当前配置文件原文（YAML 文本）。
     pub fn read_config_text(&self) -> anyhow::Result<String> {
         Ok(std::fs::read_to_string(&self.config_path)?)

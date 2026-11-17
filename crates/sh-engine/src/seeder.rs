@@ -62,7 +62,6 @@ fn reason_str(reason: &DownloadReason) -> String {
 
 /// 供报告/飞书通知统计凭据类失败（阶段3 spawn 内无法直接写 stats，
 /// 由返回值聚合后统一回填）。
-#[allow(dead_code)]
 fn is_credential_error(reason: &str) -> bool {
     CREDENTIAL_ERRORS.contains(&reason)
 }
@@ -277,6 +276,20 @@ impl ReseedEngine {
         if let Some(filter) = &opts.site_name {
             let names: HashSet<String> =
                 filter.split(',').map(|s| s.trim().to_lowercase()).collect();
+            let found: HashSet<String> = self
+                .config
+                .sites
+                .iter()
+                .map(|s| s.name.to_lowercase())
+                .collect();
+            let missing: Vec<&str> = names
+                .iter()
+                .filter(|n| !found.contains(*n))
+                .map(|n| n.as_str())
+                .collect();
+            if !missing.is_empty() {
+                tracing::warn!("以下站点未在配置中找到: {}", missing.join(", "));
+            }
             sites.retain(|s| names.contains(&s.name.to_lowercase()));
             if sites.is_empty() {
                 let available: Vec<&str> =
@@ -630,6 +643,16 @@ impl ReseedEngine {
         let site_serious_errors = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
         let site_timeout_errors = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
 
+        // 下载器现有种子 info_hash 全量集合（增量去重 + 统计口径对齐 Python：
+        // 已在下载器的种子直接记成功，不再发起 add 请求）
+        let qb_existing_hashes: HashSet<String> = {
+            let guard = self.downloader.lock().await;
+            match &*guard {
+                Some(d) => d.lock().await.qb_get_all_info_hashes().await.unwrap_or_default(),
+                None => HashSet::new(),
+            }
+        };
+
         let site_configs: HashMap<&str, &sh_core::config::SiteEntry> =
             sites.iter().map(|s| (s.name.as_str(), s)).collect();
 
@@ -684,6 +707,7 @@ impl ReseedEngine {
             let no_access = no_access_sites.clone();
             let serious = site_serious_errors.clone();
             let timeouts = site_timeout_errors.clone();
+            let qb_existing = qb_existing_hashes.clone();
             let client = self.client.clone();
             let cache = self.cache.clone();
             let dl = self.downloader.lock().await.clone(); // Option<Arc<Mutex<DownloaderClient>>>
@@ -691,15 +715,18 @@ impl ReseedEngine {
             handles.push(tokio::spawn(async move {
                 let mut piece_failed = 0u64;
                 let mut piece_failed_by_site: HashMap<String, u64> = HashMap::new();
+                let mut credential_failures: HashMap<String, String> = HashMap::new();
                 let mut skipped = false;
+                let mut source_save_path: Option<String> = None;
 
                 // 源种子状态前置检查（对齐 Python get_torrent_info）：
-                // 不在下载器 / 正在下载中则整颗跳过，避免无效的站点下载请求。
+                // 不在下载器 / 正在下载中则整颗跳过，避免无效的站点下载请求；
+                // 同时取源种子 save_path，供辅种种子落盘到同一目录。
                 if let Some(dl) = dl.as_ref() {
                     let guard = dl.lock().await;
-                    let state = guard.qb_torrent_status(&entry.info_hash).await;
+                    let info = guard.qb_torrent_info(&entry.info_hash).await;
                     drop(guard);
-                    match state.as_deref() {
+                    match info.as_ref().map(|(_, state)| state.as_str()) {
                         None => {
                             tracing::debug!(
                                 "跳过辅种: 源种子 {} 无法从下载器获取信息(可能已移除/离线)",
@@ -711,7 +738,9 @@ impl ReseedEngine {
                             tracing::debug!("跳过辅种: 源种子 {} 正在下载中", entry.file_name);
                             skipped = true;
                         }
-                        _ => {}
+                        Some(_) => {
+                            source_save_path = info.map(|(path, _)| path).filter(|p| !p.is_empty());
+                        }
                     }
                 }
 
@@ -779,6 +808,13 @@ impl ReseedEngine {
                                 }
                             }
                         } else if is_serious_error(&reason_s) {
+                            // 凭据类错误记录首个原因，供飞书「去更新凭据」提醒
+                            // （对齐 Python setdefault 语义：同站点只留首个）
+                            if is_credential_error(&reason_s) {
+                                credential_failures
+                                    .entry(site_name.clone())
+                                    .or_insert_with(|| reason_s.clone());
+                            }
                             let mut s = serious.lock().await;
                             let c = s.entry(site_name.clone()).or_insert(0);
                             *c += 1;
@@ -808,12 +844,29 @@ impl ReseedEngine {
                     // 存活确认：清除死种记录
                     let _ = cache.clear_dead_if_alive(site_name, *torrent_id);
 
-                    // 添加（此版本暂跳过 save_path 细粒度与 qb_info_hashes 增量去重，
-                    // 由 downloader 层的 add 接口承担幂等）
+                    // 增量去重（对齐 Python qb_info_hashes）：已存在直接记成功
+                    // 并写入辅种记录，跳过下载器 add 请求（双方均为小写 hex）
+                    if qb_existing.contains(&parsed.info_hash) {
+                        let _ = cache.add_reseed_record(&entry.pieces_hash, site_name, *torrent_id);
+                        tracing::debug!(
+                            "已在下载器: {} -> {site_name} (id={torrent_id})，记成功",
+                            entry.file_name
+                        );
+                        continue;
+                    }
+
+                    // 添加（save_path 传源种子保存目录，辅种种子落盘同目录）
                     let Some(dl) = dl.clone() else { continue };
                     let mut dl = dl.lock().await;
                     let result = dl
-                        .add_torrent_bytes(&torrent_data, skip_hash, auto_start, Some(torrent_tag.as_str()), &parsed.info_hash)
+                        .add_torrent_bytes(
+                            &torrent_data,
+                            skip_hash,
+                            auto_start,
+                            Some(torrent_tag.as_str()),
+                            &parsed.info_hash,
+                            source_save_path.as_deref(),
+                        )
                         .await;
                     if result {
                         let _ = cache.add_reseed_record(&entry.pieces_hash, site_name, *torrent_id);
@@ -828,19 +881,26 @@ impl ReseedEngine {
                     tokio::time::sleep(std::time::Duration::from_secs_f64(0.3)).await;
                 }
 
-                (piece_failed, piece_failed_by_site, skipped)
+                (piece_failed, piece_failed_by_site, credential_failures, skipped)
             }));
             drop(permit);
         }
 
         for h in handles {
-            if let Ok((failed, by_site, skipped)) = h.await {
+            if let Ok((failed, by_site, creds, skipped)) = h.await {
                 if skipped {
                     stats.skipped_count += 1;
                 }
                 stats.failed_count += failed;
                 for (site, cnt) in by_site {
                     *stats.site_failed.entry(site).or_insert(0) += cnt;
+                }
+                // setdefault 语义：同站点只保留最先收到的凭据错误原因
+                for (site, reason) in creds {
+                    stats
+                        .credential_failures
+                        .entry(site)
+                        .or_insert(reason);
                 }
             }
         }
@@ -915,17 +975,23 @@ impl ReseedEngine {
             } else {
                 result.indexer_name.clone()
             };
+            // 源种子 save_path（对齐 Python Jackett 分支 get_torrent_info）
             let dl_guard = self.downloader.lock().await;
             if let Some(d) = &*dl_guard {
-                let ok = d
-                    .lock()
+                let mut d = d.lock().await;
+                let source_save_path = d
+                    .qb_torrent_info(&t.info_hash)
                     .await
+                    .map(|(path, _)| path)
+                    .filter(|p| !p.is_empty());
+                let ok = d
                     .add_torrent_bytes(
                         &torrent_data,
                         false,
                         false,
                         Some(tag.as_str()),
                         &parsed.info_hash,
+                        source_save_path.as_deref(),
                     )
                     .await;
                 if ok {

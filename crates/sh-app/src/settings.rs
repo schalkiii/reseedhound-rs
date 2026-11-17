@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use gpui::*;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config_store::{
     ConfigStore, CookieCloudForm, DownloaderForm, FeishuForm, JackettForm, SiteForm,
@@ -625,9 +624,4 @@ impl Render for SettingsPage {
                     ),
             )
     }
-}
-
-#[allow(dead_code)]
-fn truncate_chars(s: &str, n: usize) -> String {
-    s.grapheme_indices(true).take(n).map(|(_, g)| g).collect()
 }

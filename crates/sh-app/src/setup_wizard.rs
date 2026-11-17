@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use gpui::*;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config_store::{ConfigStore, DownloaderForm, SiteForm};
 use crate::text_input::TextInput;
@@ -281,10 +280,4 @@ impl Render for SetupWizard {
                     ),
             )
     }
-}
-
-/// grapheme 辅助（placeholder 截断用）
-#[allow(dead_code)]
-fn truncate_chars(s: &str, n: usize) -> String {
-    s.grapheme_indices(true).take(n).map(|(_, g)| g).collect()
 }

@@ -9,7 +9,7 @@
 |---|---|---|
 | 异步运行时 | tokio (full) | 标准选择 |
 | HTTP | reqwest + rustls-tls | `pool_max_idle_per_host(0)` 等价 Python force_close |
-| GUI | **gpui-ce 0.3** (社区版) | Windows Win32+DirectX；Rust≥1.95（本机 1.99.1）；crates.io 可直接依赖，避免 Zed git pin 问题 |
+| GUI | **gpui 0.2**（crates.io） | Windows Win32+DirectX；实际依赖以 Cargo.toml 为准（选型时评估过 gpui-ce 0.3，最终用官方 gpui 0.2.2，适配记录见 docs/GUI-FIX-2026-11-16.md） |
 | 托盘 | tray-icon + muda (菜单) | Windows 原生托盘，成熟 |
 | SQLite | rusqlite (bundled) | schema 与 Python 版完全兼容 |
 | CLI | clap 4 derive | 子命令对齐 Python 版 |
@@ -38,24 +38,27 @@ reseedhound-rs/
 
 依赖方向: app/cli → engine → core。core 不依赖 tokio（解析用 rayon）。
 
-## 实施进度（2026-11-16 更新）
+## 实施进度（2026-11-17 更新；M1-M6 全部完成，本文档已收口，后续进展见 AGENTS.md）
 
 - ✅ M1 sh-core：bencode 零拷贝/parser(golden)/config/cache/stats/report/site_table
 - ✅ M2 sh-engine：site_client/downloader/hdarea/jackett/feishu/seeder/scheduler
   + **cookiecloud**（AES-256-CBC EVP_BytesToKey 解密 + 域名匹配 + 写回 sites.yaml + 调度器每轮前置同步）
   + **savept**（分页拉取死亡名单 + 三级匹配 high/medium + check-dead --apply 文本行禁用写回）
-- ✅ M3 sh-cli：clap 4 子命令（reseed/schedule/sync-cookies/check-dead/gui）
-- ✅ M4+M5 合并为 sh-app：GPUI 仪表盘（指标卡+日志面板+立即辅种按钮）+ tray-icon 托盘
-- ✅ M6 验证/优化/交付：64 测试全绿（sh-core 31 + sh-engine 28 + sh-app 5）；clippy 项目代码 0 警告；
+- ✅ M3 sh-cli：clap 4 子命令（reseed/schedule/sync-cookies/check-dead/weekly-report/gui）
+- ✅ M4+M5 合并为 sh-app：GPUI 仪表盘 + 首启向导 + 设置页 + tray-icon 托盘
+- ✅ M6 验证/优化/交付：76 测试全绿（sh-core 35 + sh-engine 32 + sh-app 9）；clippy 项目代码 0 警告；
   benchmark 10k 种子 Python 3.28s vs Rust 1.59s（2.0×，见 docs/BENCHMARK.md）；
-  release 产物 reseedhound.exe 9.1MB / reseedhound-gui.exe 14.5MB；
-  tag v0.1.0 待用户确认（项目目录尚未 git init）
+  tag v0.1.0 已发布（git init + 4 commits，身份 schalkiii@github.com）
 - ✅ 二轮深化（GUI 大改版 + 审计修复，2026-11-16 晚）：
   + GUI 7 模块重构（theme/text_input/config_store/setup_wizard/dashboard/settings/tray）：
     首启向导、配置编辑页（下载器/调度/站点增删改）、视觉体系升级
   + 审计修复 6 项：--mode 死参数接通、HDArea dl_token 短效直链传递、
     signin 匹配、死种持久化接通（record_dead）、源种子前置状态检查、
     stats_shared 死代码删除（详见 docs/AUDIT-2026-11-16.md 二轮章节）
+- ✅ 三轮 + GUI 轮 + 审美轮（2026-11-17）：文件日志/weekly-report/SEEDHOUND_MODE/reseed 自动升级；
+  GUI 修 Tab/布局/退出残留并补齐 CLI 覆盖；全 GUI 去 AI 味重做（石墨色板/下划线 Tab/滑块开关）；
+  第四轮审计修复：credential_failures 回填、--site missing 告警、qb_info_hashes 增量去重、
+  save_path 传递、README 补齐（见 docs/AUDIT-REPORT-2026-11-17.md）
 
 ## 2. 里程碑
 
