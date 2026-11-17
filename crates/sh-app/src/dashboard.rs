@@ -37,6 +37,9 @@ pub struct RunState {
     pub action_result: String,
     /// 工具动作是否正在执行。
     pub action_running: bool,
+    /// 本轮站点范围（空 = 全部）。GUI 选择后由调度器 options_provider 注入 `--site`，
+    /// 每轮结束由 on_report 清空——只影响下一轮，定时轮次仍跑全部站点。
+    pub selected_sites: Vec<String>,
 }
 
 impl RunState {
@@ -77,6 +80,56 @@ pub struct Dashboard {
     pub settings: Option<Entity<crate::settings::SettingsPage>>,
     /// 配置读写中心（设置页用）
     pub config_store: Arc<crate::config_store::ConfigStore>,
+    /// 站点选择面板是否展开（本轮站点范围）
+    pub picker_open: bool,
+    /// 可选站点名（打开面板时从 sites.yaml 加载，仅 enabled 站点）
+    pub site_names: Vec<String>,
+}
+
+impl Dashboard {
+    /// 打开/关闭站点范围面板；打开时从磁盘重读启用站点名。
+    fn toggle_picker(&mut self, cx: &mut Context<Self>) {
+        self.picker_open = !self.picker_open;
+        if self.picker_open {
+            self.site_names = self
+                .config_store
+                .load_sites_form()
+                .map(|forms| {
+                    forms
+                        .into_iter()
+                        .filter(|form| form.enabled && !form.name.is_empty())
+                        .map(|form| form.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        cx.notify();
+    }
+
+    /// 切换单个站点的选中态（写入共享 RunState，调度器下轮读取）。
+    fn toggle_site(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Ok(mut s) = self.state.lock() {
+            match s.selected_sites.iter().position(|n| n == name) {
+                Some(idx) => {
+                    s.selected_sites.remove(idx);
+                }
+                None => s.selected_sites.push(name.to_string()),
+            }
+        }
+        cx.notify();
+    }
+
+    /// 一次性设置全部站点（全选 / 清空）。
+    fn set_all_sites(&mut self, all: bool, cx: &mut Context<Self>) {
+        if let Ok(mut s) = self.state.lock() {
+            s.selected_sites = if all {
+                self.site_names.clone()
+            } else {
+                Vec::new()
+            };
+        }
+        cx.notify();
+    }
 }
 
 impl Dashboard {
@@ -161,6 +214,9 @@ impl Render for Dashboard {
         } else {
             Some(s.action_result.clone())
         };
+        let selected_sites = s.selected_sites.clone();
+        let picker_open = self.picker_open;
+        let site_names = self.site_names.clone();
 
         div()
             .flex()
@@ -354,6 +410,82 @@ impl Render for Dashboard {
                             ),
                     ),
             )
+            // 站点范围面板（本轮只跑选中站点；每轮结束自动恢复全部）
+            .child(if picker_open {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .pb_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_FAINT)
+                                    .child(format!(
+                                        "站点范围 · 已选 {} / {}（本轮生效，跑完自动恢复全部）",
+                                        selected_sites.len(),
+                                        site_names.len()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(Self::tool_button("全选", "site-pick-all", cx.listener(
+                                        |this, _ev, _w, cx| this.set_all_sites(true, cx),
+                                    )))
+                                    .child(Self::tool_button("清空", "site-pick-none", cx.listener(
+                                        |this, _ev, _w, cx| this.set_all_sites(false, cx),
+                                    )))
+                                    .child(Self::tool_button("收起", "site-pick-close", cx.listener(
+                                        |this, _ev, _w, cx| {
+                                            this.picker_open = false;
+                                            cx.notify();
+                                        },
+                                    ))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("site-picker")
+                            .max_h(px(176.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .children(site_names.iter().enumerate().map(|(idx, name)| {
+                                let name = name.clone();
+                                let selected = selected_sites.iter().any(|n| n == &name);
+                                let toggle_name = name.clone();
+                                div()
+                                    .id(("site-pick", idx))
+                                    .px_2()
+                                    .py(px(3.))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(if selected { theme::ACCENT } else { theme::DIVIDER })
+                                    .bg(if selected { theme::SURFACE } else { theme::INPUT_BG })
+                                    .text_xs()
+                                    .text_color(if selected { theme::TEXT } else { theme::TEXT_DIM })
+                                    .hover(|s| s.cursor_pointer())
+                                    .child(format!("{} {name}", if selected { "●" } else { "○" }))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _ev, _w, cx| {
+                                            this.toggle_site(&toggle_name, cx);
+                                        }),
+                                    )
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             // 工具动作行 + 结果
             .child(
                 div()
@@ -369,6 +501,15 @@ impl Render for Dashboard {
                             .flex()
                             .gap_1()
                             .items_center()
+                            .child(Self::tool_button(
+                                &if selected_sites.is_empty() {
+                                    "站点范围 · 全部".to_string()
+                                } else {
+                                    format!("站点范围 · 已选 {} 个", selected_sites.len())
+                                },
+                                "act-site-scope",
+                                cx.listener(|this, _ev, _w, cx| this.toggle_picker(cx)),
+                            ))
                             .child(Self::tool_button("同步 Cookie", "act-sync-cookies", cx.listener(
                                 |this, _ev, _w, _cx| {
                                     this.request_action(GuiAction::SyncCookies);

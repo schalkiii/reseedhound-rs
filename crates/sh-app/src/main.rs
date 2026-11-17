@@ -96,6 +96,8 @@ impl RootView {
             page: dashboard::Page::Dashboard,
             settings: None,
             config_store: parts.store.clone(),
+            picker_open: false,
+            site_names: Vec::new(),
         });
         *self = RootView::Dash(dash);
         cx.notify();
@@ -265,16 +267,32 @@ fn main() {
         };
         let arm = arm_scheduler.clone();
 
+        // 窗口尺寸按主显示器收敛并居中：origin 默认 (0,0) 会让窗体贴死左上角，
+        // 高 DPI/缩放时标题栏甚至落到屏幕外。
+        let window_size = {
+            const PREFERRED: (f32, f32) = (960.0, 680.0);
+            match cx.primary_display() {
+                Some(display) => {
+                    let bounds = display.bounds();
+                    let width: f32 = bounds.size.width.into();
+                    let height: f32 = bounds.size.height.into();
+                    size(
+                        px((width - 80.0).clamp(720.0, PREFERRED.0)),
+                        px((height - 120.0).clamp(520.0, PREFERRED.1)),
+                    )
+                }
+                None => size(px(PREFERRED.0), px(PREFERRED.1)),
+            }
+        };
+        let window_bounds = Bounds::centered(None, window_size, cx);
+
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("ReseedHound RS".into()),
                     ..Default::default()
                 }),
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    size: size(px(960.), px(680.)),
-                    origin: Default::default(),
-                })),
+                window_bounds: Some(WindowBounds::Windowed(window_bounds)),
                 ..Default::default()
             },
             move |_window, cx| {
@@ -289,6 +307,8 @@ fn main() {
                             page: dashboard::Page::Dashboard,
                             settings: None,
                             config_store: parts.store.clone(),
+                            picker_open: false,
+                            site_names: Vec::new(),
                         });
                         RootView::Dash(dash)
                     })
@@ -440,6 +460,10 @@ fn spawn_scheduler(
                     if let Some(e) = &report.error {
                         s.push_log(e.clone());
                     }
+                    // 站点范围只作用于一轮：跑完清空，定时轮次恢复全部站点
+                    if !s.selected_sites.is_empty() {
+                        s.selected_sites.clear();
+                    }
                 }) as Arc<dyn Fn(&sh_engine::scheduler::CycleReport) + Send + Sync>
             };
 
@@ -453,10 +477,15 @@ fn spawn_scheduler(
             {
                 let state_ref = state.clone();
                 scheduler = scheduler.with_options_provider(Arc::new(move || {
-                    state_ref
-                        .lock()
-                        .ok()
-                        .map(|s| RunOptions { dry_run: s.dry_run, site_name: None })
+                    state_ref.lock().ok().map(|s| RunOptions {
+                        dry_run: s.dry_run,
+                        // GUI「站点范围」选择：非空则本轮只跑这些站点（对应 CLI --site）
+                        site_name: if s.selected_sites.is_empty() {
+                            None
+                        } else {
+                            Some(s.selected_sites.join(","))
+                        },
+                    })
                 }));
             }
 

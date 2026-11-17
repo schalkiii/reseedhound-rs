@@ -41,6 +41,8 @@ pub struct SettingsPage {
     dl_auto_start: bool,
     // 站点列表（当前编辑态）
     sites: Vec<SiteRow>,
+    /// 站点快速筛选（名称 / 域名子串）
+    site_filter: Entity<TextInput>,
     // 调度 & 全局
     sched_enabled: bool,
     sched_interval: Entity<TextInput>,
@@ -124,6 +126,7 @@ impl SettingsPage {
             dl_skip_hash_check: dl.skip_hash_check.unwrap_or(true),
             dl_auto_start: dl.auto_start.unwrap_or(true),
             sites: site_rows,
+            site_filter: input("搜索站点名 / 域名", "", cx),
             sched_enabled: sched.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
             sched_interval: input("360", &sched.get("interval_minutes")
                 .and_then(|v| v.as_f64()).map(|n| format!("{n}")).unwrap_or_default(), cx),
@@ -146,6 +149,36 @@ impl SettingsPage {
             log_file: input("logs/reseed.log", &log_file, cx),
             status: None,
         }
+    }
+
+    /// 行内迷你按钮（↑ ↓ ×）：disabled 时不响应、颜色透明。
+    fn mini_button(
+        label: &'static str,
+        id: (&'static str, usize),
+        disabled: bool,
+        danger: bool,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex_none()
+            .w(px(20.))
+            .py(px(2.))
+            .rounded_sm()
+            .text_xs()
+            .text_color(if disabled { theme::TRANSPARENT } else { theme::TEXT_FAINT })
+            .hover(move |s| {
+                if disabled {
+                    s
+                } else if danger {
+                    s.cursor_pointer().text_color(theme::RED).bg(theme::BTN_GHOST_HOVER)
+                } else {
+                    s.cursor_pointer().text_color(theme::TEXT).bg(theme::BTN_GHOST_HOVER)
+                }
+            })
+            .child(label.to_string())
+            .on_mouse_down(MouseButton::Left, handler)
+            .into_any_element()
     }
 
     fn field_row(label: &str, input: &Entity<TextInput>, hint: Option<&str>) -> AnyElement {
@@ -429,106 +462,145 @@ impl Render for SettingsPage {
                                     ),
                                 ],
                                 Tab::Sites => {
-                                    let mut rows: Vec<AnyElement> = self.sites.iter().enumerate().map(|(idx, row)| {
+                                    // 快速筛选：按名称/域名子串过滤（保存仍作用于全量表单）
+                                    let query = self.site_filter.read(cx).value().trim().to_lowercase();
+                                    let matched: Vec<usize> = self
+                                        .sites
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, row)| {
+                                            query.is_empty()
+                                                || row.name.read(cx).value().to_lowercase().contains(&query)
+                                                || row.url.read(cx).value().to_lowercase().contains(&query)
+                                        })
+                                        .map(|(idx, _)| idx)
+                                        .collect();
+                                    let total = self.sites.len();
+                                    let mut rows: Vec<AnyElement> = vec![
+                                        // 搜索框 + 计数
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_3()
+                                            .pb_2()
+                                            .child(div().flex_1().child(self.site_filter.clone()))
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_FAINT)
+                                                    .child(format!("{} / {} 个", matched.len(), total)),
+                                            )
+                                            .into_any_element(),
+                                        // 列头（与行内控件同宽，紧凑对齐）
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .pb_1()
+                                            .text_xs()
+                                            .text_color(theme::TEXT_FAINT)
+                                            .child(div().w(px(12.)))
+                                            .child(div().w(px(132.)).child("名称"))
+                                            .child(div().flex_1().child("主页"))
+                                            .child(div().flex_1().child("Passkey"))
+                                            .child(div().w(px(30.)).child("启用"))
+                                            .child(div().w(px(66.)))
+                                            .into_any_element(),
+                                    ];
+                                    for idx in matched {
+                                        let row = &self.sites[idx];
                                         let enabled = row.form.enabled;
                                         let (dot, color) = if enabled {
                                             ("●", theme::GREEN)
                                         } else {
                                             ("○", theme::TEXT_FAINT)
                                         };
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_3()
-                                            .px_5()
-                                            .py_4()
-                                            .rounded_md()
-                                            .bg(theme::INPUT_BG)
-                                            .child(
-                                                div().flex().justify_between().items_center()
-                                                    .child(
-                                                        div().flex().items_center().gap_2()
-                                                            .child(div().text_xs().text_color(color).child(dot.to_string()))
-                                                            .child(div().text_sm().text_color(theme::TEXT_DIM).child(format!("站点 #{}", idx + 1))),
-                                                    )
-                                            .child(
-                                                div().flex().gap_2()
-                                                    .child(
-                                                        div()
-                                                            .id(("site-toggle", idx))
-                                                            .rounded_md()
-                                                            .hover(|s| s.cursor_pointer())
-                                                            .child(Self::switch(enabled))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                                        rows.push(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .border_b_1()
+                                                .border_color(theme::DIVIDER)
+                                                .child(
+                                                    div()
+                                                        .w(px(12.))
+                                                        .text_xs()
+                                                        .text_color(color)
+                                                        .child(dot.to_string()),
+                                                )
+                                                .child(div().w(px(132.)).child(row.name.clone()))
+                                                .child(div().flex_1().child(row.url.clone()))
+                                                .child(div().flex_1().child(row.passkey.clone()))
+                                                .child(
+                                                    div()
+                                                        .id(("site-toggle", idx))
+                                                        .flex_none()
+                                                        .w(px(30.))
+                                                        .hover(|s| s.cursor_pointer())
+                                                        .child(Self::switch(enabled))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _ev, _w, cx| {
                                                                 if let Some(r) = this.sites.get_mut(idx) {
                                                                     r.form.enabled = !r.form.enabled;
                                                                 }
                                                                 cx.notify();
-                                                            })),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("site-up", idx))
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded_md()
-                                                            .text_xs()
-                                                            .text_color(if idx == 0 { theme::TRANSPARENT } else { theme::TEXT_FAINT })
-                                                            .hover(|s| if idx == 0 { s } else { s.cursor_pointer().text_color(theme::TEXT).bg(theme::BTN_GHOST_HOVER) })
-                                                            .child("上移")
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                                                            }),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_none()
+                                                        .w(px(66.))
+                                                        .gap_1()
+                                                        .child(Self::mini_button(
+                                                            "↑",
+                                                            ("site-up", idx),
+                                                            idx == 0,
+                                                            false,
+                                                            cx.listener(move |this, _ev, _w, cx| {
                                                                 if idx > 0 {
                                                                     this.sites.swap(idx, idx - 1);
                                                                     cx.notify();
                                                                 }
-                                                            })),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("site-down", idx))
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded_md()
-                                                            .text_xs()
-                                                            .text_color(if idx + 1 >= self.sites.len() { theme::TRANSPARENT } else { theme::TEXT_FAINT })
-                                                            .hover(|s| if idx + 1 >= self.sites.len() { s } else { s.cursor_pointer().text_color(theme::TEXT).bg(theme::BTN_GHOST_HOVER) })
-                                                            .child("下移")
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                                                            }),
+                                                        ))
+                                                        .child(Self::mini_button(
+                                                            "↓",
+                                                            ("site-down", idx),
+                                                            idx + 1 >= total,
+                                                            false,
+                                                            cx.listener(move |this, _ev, _w, cx| {
                                                                 if idx + 1 < this.sites.len() {
                                                                     this.sites.swap(idx, idx + 1);
                                                                     cx.notify();
                                                                 }
-                                                            })),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("site-del", idx))
-                                                            .px_2()
-                                                            .py_1()
-                                                            .rounded_md()
-                                                            .text_xs()
-                                                            .text_color(theme::TEXT_FAINT)
-                                                            .hover(|s| s.cursor_pointer().text_color(theme::RED).bg(theme::BTN_GHOST_HOVER))
-                                                            .child("删除")
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
-                                                                if this.sites.len() > idx {
+                                                            }),
+                                                        ))
+                                                        .child(Self::mini_button(
+                                                            "×",
+                                                            ("site-del", idx),
+                                                            false,
+                                                            true,
+                                                            cx.listener(move |this, _ev, _w, cx| {
+                                                                if idx < this.sites.len() {
                                                                     this.sites.remove(idx);
                                                                 }
                                                                 cx.notify();
-                                                            })),
-                                                    ),
-                                            ),
-                                            )
-                                            .child(div().flex().gap_3()
-                                                .child(div().flex_1().child(Self::field_row("名称", &row.name, None)))
-                                                .child(div().flex_1().child(Self::field_row("主页", &row.url, None))))
-                                            .child(Self::field_row("Passkey", &row.passkey, None))
-                                            .into_any_element()
-                                    }).collect();
+                                                            }),
+                                                        )),
+                                                )
+                                                .into_any_element(),
+                                        );
+                                    }
                                     // 新增站点（ghost 文字按钮）
                                     rows.push(
                                         div()
                                             .id("site-add")
+                                            .mt_2()
                                             .px_3()
                                             .py_2()
                                             .rounded_md()

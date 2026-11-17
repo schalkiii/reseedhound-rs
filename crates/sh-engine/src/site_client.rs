@@ -535,6 +535,8 @@ impl SiteClient {
             format!(" [{label}]")
         };
         let mut last_error = String::new();
+        // 首次失败原因：重试恢复时一并打出，便于定位超时/限流（否则只有 DEBUG 可见）
+        let mut first_error = String::new();
         let mut attempts = 0u32;
 
         for attempt in 0..retries.max(1) {
@@ -556,7 +558,7 @@ impl SiteClient {
                                 Ok(v) => {
                                     if attempt > 0 {
                                         tracing::info!(
-                                            "请求成功 {url}{suffix} (第 {attempt} 次重试后恢复)"
+                                            "请求成功 {url}{suffix} (第 {attempt} 次重试后恢复，首次错误: {first_error})"
                                         );
                                     }
                                     return Some(v);
@@ -582,6 +584,9 @@ impl SiteClient {
                             continue;
                         }
                         last_error = format!("HTTP {code}");
+                        if first_error.is_empty() {
+                            first_error = last_error.clone();
+                        }
                         if NON_RETRYABLE_HTTP_STATUS.contains(&code) {
                             tracing::warn!("请求失败 {url}{suffix} ({last_error}，硬失败不重试)");
                             return None;
@@ -593,6 +598,9 @@ impl SiteClient {
                     }
                     Err(e) => {
                         last_error = e.to_string();
+                        if first_error.is_empty() {
+                            first_error = last_error.clone();
+                        }
                         if is_non_retryable_error(&last_error) {
                             tracing::warn!("请求失败 {url}{suffix} ({last_error}，硬失败不重试)");
                             return None;
