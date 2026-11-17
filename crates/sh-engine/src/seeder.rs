@@ -76,6 +76,16 @@ pub struct RunOptions {
     pub dry_run: bool,
     /// 站点过滤（逗号分隔，空 = 全部）
     pub site_name: Option<String>,
+    /// 终止标志：置位后引擎在批次边界提前收尾（GUI「终止本轮」）。
+    /// 已完成的部分统计照常上报，未开始的批次不再请求站点/下载器。
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// 本轮是否已被终止（批次边界检查，粒度 = 一批查询 / 一颗种子）。
+fn is_cancelled(cancel: &Option<Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    cancel
+        .as_ref()
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 pub struct ReseedEngine {
@@ -315,16 +325,19 @@ impl ReseedEngine {
                 stats.new_torrents
             );
             let (match_map, download_url_map) = self
-                .phase_query_sites(&sites, &torrents, &mut stats)
+                .phase_query_sites(&sites, &torrents, &mut stats, &opts.cancel)
                 .await?;
 
-            if !opts.dry_run {
+            if is_cancelled(&opts.cancel) {
+                tracing::warn!("收到终止信号，跳过阶段3（本轮部分结果已统计）");
+            } else if !opts.dry_run {
                 self.phase_add_torrents(
                     &match_map,
                     &download_url_map,
                     &sites,
                     &torrents,
                     &mut stats,
+                    &opts.cancel,
                 )
                 .await?;
             } else {
@@ -406,6 +419,7 @@ impl ReseedEngine {
         sites: &[sh_core::config::SiteEntry],
         torrents: &[TorrentInfo],
         stats: &mut ReseedStats,
+        cancel: &Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<(
         HashMap<String, Vec<(String, i64, String)>>,
         HashMap<(String, i64), String>,
@@ -495,6 +509,8 @@ impl ReseedEngine {
             let info_hash_index = info_hash_index.clone();
             let batch_size = self.batch_size;
             let retry_count = self.config.retry_count();
+            // 先取拥有所有权的终止标志（外层任务闭包需要 move 进去）
+            let cancel = cancel.as_ref().cloned();
             let site_hashes: Vec<String> = pieces_all
                 .iter()
                 .filter(|ph| !exclude.contains(ph.as_str()))
@@ -570,7 +586,11 @@ impl ReseedEngine {
                             let batch_fail = batch_fail.clone();
                             let results = results.clone();
                             let retry_count = retry_count.max(1);
+                            let cancel = cancel.as_ref().cloned();
                             batch_handles.push(tokio::spawn(async move {
+                                if is_cancelled(&cancel) {
+                                    return;
+                                }
                                 if site_dead.load(std::sync::atomic::Ordering::Relaxed) {
                                     return;
                                 }
@@ -709,6 +729,7 @@ impl ReseedEngine {
         sites: &[sh_core::config::SiteEntry],
         torrents: &[TorrentInfo],
         stats: &mut ReseedStats,
+        cancel: &Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<()> {
         tracing::info!("[阶段3] 添加种子到下载器...");
         if match_map.is_empty() {
@@ -789,8 +810,12 @@ impl ReseedEngine {
             let client = self.client.clone();
             let cache = self.cache.clone();
             let dl = self.downloader.lock().await.clone(); // Option<Arc<Mutex<DownloaderClient>>>
+            let cancel = cancel.as_ref().cloned();
 
             handles.push(tokio::spawn(async move {
+                if is_cancelled(&cancel) {
+                    return (0, HashMap::new(), HashMap::new(), false);
+                }
                 let mut piece_failed = 0u64;
                 let mut piece_failed_by_site: HashMap<String, u64> = HashMap::new();
                 let mut credential_failures: HashMap<String, String> = HashMap::new();
@@ -823,7 +848,7 @@ impl ReseedEngine {
                 }
 
                 for (i, (site_name, torrent_id, site_url)) in matches.iter().enumerate() {
-                    if skipped {
+                    if skipped || is_cancelled(&cancel) {
                         break;
                     }
                     let site_cfg = match site_configs_owned.get(i) {
@@ -953,6 +978,13 @@ impl ReseedEngine {
                             entry.file_name
                         );
                     } else {
+                        // 下载 .torrent 已消耗站点下载配额，添加失败必须显式记录，
+                        // 否则表现为「配额被消耗但 qB 里没有」却无从追查
+                        tracing::warn!(
+                            "添加失败（已消耗 {site_name} 下载配额）: {} (id={torrent_id}, save_path={:?})",
+                            entry.file_name,
+                            source_save_path,
+                        );
                         piece_failed += 1;
                         *piece_failed_by_site.entry(site_name.clone()).or_insert(0) += 1;
                     }

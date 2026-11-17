@@ -36,7 +36,7 @@ GUI 覆盖 CLI 全部功能：仪表盘可触发立即辅种 / 同步 Cookie / �
 
 ## 当前状态与下一步
 
-- 全部功能移植完成（三轮审计：轮二修 6 项缺陷、轮三补文件日志/weekly-report/SEEDHOUND_MODE/reseed 自动升级；GUI 轮：修 Tab 切换/布局/退出残留，补齐 CLI 功能 GUI 覆盖；审美轮：全 GUI 去模板味重做——石墨色板/下划线 Tab/滑块开关/无框卡片/等宽数据条；审计四轮（AUDIT-REPORT-2026-11-17）：credential_failures 回填/ --site missing 告警 / qb_info_hashes 增量去重 / save_path 传递 / README 补齐；配置实机轮（CONFIG-FIX-2026-11-17）：数值标量显示/写回引号/站点补行缩进/qB 5.x 会话 cookie/CookieCloud 口令派生与 fixed-IV/退出不阻塞/遮罩输入投影/panic 日志）；交互轮（2026-11-17 晚）：设置站点页搜索筛选 + 单行紧凑表格、仪表盘「本轮站点范围」多选（GUI 版 --site，一轮后自动恢复全部）、启动窗口按主屏居中，88/88 测试，clippy 0 警告
+- 全部功能移植完成（三轮审计：轮二修 6 项缺陷、轮三补文件日志/weekly-report/SEEDHOUND_MODE/reseed 自动升级；GUI 轮：修 Tab 切换/布局/退出残留，补齐 CLI 功能 GUI 覆盖；审美轮：全 GUI 去模板味重做——石墨色板/下划线 Tab/滑块开关/无框卡片/等宽数据条；审计四轮（AUDIT-REPORT-2026-11-17）：credential_failures 回填/ --site missing 告警 / qb_info_hashes 增量去重 / save_path 传递 / README 补齐；配置实机轮（CONFIG-FIX-2026-11-17）：数值标量显示/写回引号/站点补行缩进/qB 5.x 会话 cookie/CookieCloud 口令派生与 fixed-IV/退出不阻塞/遮罩输入投影/panic 日志）；交互轮（2026-11-17 晚）：设置站点页搜索筛选 + 单行紧凑表格、仪表盘「本轮站点范围」多选（GUI 版 --site，一轮后自动恢复全部）、启动窗口按主屏居中、日志自动滚底、辅种中「终止本轮」（批次边界收尾）、add 失败显式日志，88/88 测试，clippy 0 警告
 - 遗留（见 AUDIT-REPORT-2026-11-17 P3 与 AUDIT-2026-11-16 遗留建议）：无（qB 5.x 与 CookieCloud 均已真机验证：qB 5.3.0 登录 204 + `QBT_SID_<端口>`；CookieCloud 真实服务端 86/100 站点同步成功）。站内批次并发 2+熔断、连接池上限调优、站点上移/下移、调度开关实时生效已于 2026-11-17 第二轮全部修复
 - 构建提示：gpui 在**非 debug** 配置下由 build.rs 调用 `fxc.exe` 预编译 HLSL（debug 走 d3dcompiler 运行时编译）。无 Windows SDK 的机器只能 `cargo build`（debug），`cargo build --release` 需 `fxc.exe` 或 `GPUI_FXC_PATH`
 - git：远程 https://github.com/schalkiii/reseedhound-rs（Public）；v0.2.0 已发布 release（附 CLI/GUI 双 exe，https://github.com/schalkiii/reseedhound-rs/releases/tag/v0.2.0），提交身份 schalkiii@github.com

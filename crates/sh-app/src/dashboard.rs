@@ -40,9 +40,18 @@ pub struct RunState {
     /// 本轮站点范围（空 = 全部）。GUI 选择后由调度器 options_provider 注入 `--site`，
     /// 每轮结束由 on_report 清空——只影响下一轮，定时轮次仍跑全部站点。
     pub selected_sites: Vec<String>,
+    /// 终止标志：GUI「终止本轮」置位，引擎在批次边界提前收尾。
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RunState {
+    /// 取（或建）终止标志：调度器 options_provider 每轮引用同一实例。
+    pub fn cancel_flag(&mut self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.cancel
+            .get_or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    }
+
     pub fn push_log(&mut self, line: String) {
         self.log_lines.push(line);
         if self.log_lines.len() > 200 {
@@ -84,6 +93,10 @@ pub struct Dashboard {
     pub picker_open: bool,
     /// 可选站点名（打开面板时从 sites.yaml 加载，仅 enabled 站点）
     pub site_names: Vec<String>,
+    /// 日志面板滚动句柄（自动滚到底部）
+    pub log_scroll: ScrollHandle,
+    /// 上次渲染的日志行数（变化时触达底部）
+    pub last_log_len: usize,
 }
 
 impl Dashboard {
@@ -141,6 +154,16 @@ impl Dashboard {
     /// 请求执行工具动作（通道满 1 则忽略，防连点）。
     pub fn request_action(&self, action: GuiAction) {
         let _ = self.actions.try_send(action);
+    }
+
+    /// 请求终止本轮辅种：置位后引擎在批次边界收尾（已开始的批次会跑完）。
+    pub fn request_stop(&mut self, cx: &mut Context<Self>) {
+        if let Ok(mut s) = self.state.lock() {
+            s.cancel_flag()
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            s.push_log("[终止] 已请求终止本轮，将在批次边界收尾…".into());
+        }
+        cx.notify();
     }
 
     /// 数据条单元：小灰标签 + 数值（无框无卡，纯排版）。
@@ -217,6 +240,14 @@ impl Render for Dashboard {
         let selected_sites = s.selected_sites.clone();
         let picker_open = self.picker_open;
         let site_names = self.site_names.clone();
+
+        // 日志自动滚到底部：行数变化时把偏移推到 max（用上一帧布局值，下一帧刷新到位），
+        // 手动上滚后只要没有新行就不会被强行拽回底部。
+        if s.log_lines.len() != self.last_log_len {
+            self.last_log_len = s.log_lines.len();
+            let bottom = self.log_scroll.max_offset().height;
+            self.log_scroll.set_offset(point(px(0.), bottom));
+        }
 
         div()
             .flex()
@@ -390,6 +421,7 @@ impl Render for Dashboard {
                     .child(
                         div()
                             .id("log-panel")
+                            .track_scroll(&self.log_scroll)
                             .flex_1()
                             .min_h_0()
                             .rounded_md()
@@ -600,6 +632,27 @@ impl Render for Dashboard {
                                 }),
                             ),
                     )
+                    .children(if s.running {
+                        vec![div()
+                            .id("stop-btn")
+                            .px_4()
+                            .py_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::RED)
+                            .text_color(theme::RED)
+                            .text_sm()
+                            .hover(|s| s.cursor_pointer().bg(theme::BTN_GHOST_HOVER))
+                            .child("终止本轮")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _ev, _window, cx| {
+                                    this.request_stop(cx);
+                                }),
+                            )]
+                    } else {
+                        vec![]
+                    })
                     .child(
                         div()
                             .id("run-now-btn")

@@ -123,6 +123,7 @@ fn run_options(cli: &Cli) -> RunOptions {
     RunOptions {
         dry_run: cli.dry_run,
         site_name: cli.site.clone(),
+        cancel: None,
     }
 }
 

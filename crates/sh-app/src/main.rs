@@ -98,6 +98,8 @@ impl RootView {
             config_store: parts.store.clone(),
             picker_open: false,
             site_names: Vec::new(),
+            log_scroll: gpui::ScrollHandle::new(),
+            last_log_len: 0,
         });
         *self = RootView::Dash(dash);
         cx.notify();
@@ -309,6 +311,8 @@ fn main() {
                             config_store: parts.store.clone(),
                             picker_open: false,
                             site_names: Vec::new(),
+                            log_scroll: gpui::ScrollHandle::new(),
+                            last_log_len: 0,
                         });
                         RootView::Dash(dash)
                     })
@@ -436,6 +440,9 @@ fn spawn_scheduler(
                 Arc::new(move |cycle: u64| {
                     if let Ok(mut s) = bg_state.lock() {
                         s.running = true;
+                        // 每轮开始重置终止标志（上一轮的终止请求不带到下一轮）
+                        s.cancel_flag()
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                         s.push_log(format!("[{cycle}] 开始辅种…"));
                     }
                 }) as Arc<dyn Fn(u64) + Send + Sync>
@@ -485,6 +492,8 @@ fn spawn_scheduler(
                         } else {
                             Some(s.selected_sites.join(","))
                         },
+                        // 「终止本轮」标志：每轮 on_cycle_start 重置
+                        cancel: s.cancel.clone(),
                     })
                 }));
             }
