@@ -88,7 +88,7 @@
 1. **口令派生错**：旧实现把 `md5("{uuid}-{password}")` 的**原始 16 字节**当作 EVP 口令。
    CookieCloud 官方算法是取该 MD5 **十六进制串的前 16 个字符**（ASCII）当 CryptoJS 口令，
    再由 EVP_BytesToKey(MD5, 口令, salt) 派生 key/iv 做 AES-256-CBC。
-   实测验证：对本机服务端 1 MB 密文用 `openssl enc -d -aes-256-cbc -md md5 -pass pass:<按上述规则算出的口令>` 可直接解出 JSON（cmd 环境同时验证了派生规则）。
+   实测验证：对本机服务端 1 MB 密文用 `openssl enc -d -aes-256-cbc -md md5 -pass pass:<按上述规则算出的口令>` 可直接解出 JSON（与 openssl 独立解出的明文互验一致）。
 2. **未支持新格式**：0.3.0 起服务端返回 `crypto_type: aes-128-cbc-fixed`（key=口令 16 字节、IV 全 0、无 `Salted__` 头），旧实现只看 `Salted__`。
 3. **退出阻塞**：`on_app_quit` 在 UI 线程 `join()` 调度线程；引擎正在跑整轮（4 万种子扫描 + 站点查询）时关窗 → 窗口无响应，只能强杀，表现为「卡死 + abort」。
 
