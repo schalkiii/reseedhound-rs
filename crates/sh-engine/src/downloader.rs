@@ -42,13 +42,26 @@ pub struct DownloaderConn {
 pub struct DownloaderClient {
     conn: DownloaderConn,
     http: reqwest::Client,
-    qb_cookie: Option<String>,
+    /// qB 会话 cookie（名, 值）：qB ≤4.x 为 `SID`，5.x 改名为 `QBT_SID_<端口>`
+    qb_session: Option<(String, String)>,
 }
 
 /// 下载结果：添加的任务 hash + 初始状态。
 #[derive(Debug, Clone)]
 pub struct AddResult {
     pub info_hashes: Vec<String>,
+}
+
+/// 从 Set-Cookie 头提取 qB 会话 cookie。
+///
+/// qB ≤4.x 用 `SID=<值>`，5.x 起改名为 `QBT_SID_<WebUI 端口>=<值>`；
+/// 只认 `SID` 会让 5.x 登录成功（204）却被判成连接失败。
+fn parse_qb_session<'a>(set_cookies: impl Iterator<Item = &'a str>) -> Option<(String, String)> {
+    set_cookies
+        .filter_map(|line| line.split(';').next())
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == "SID" || name.starts_with("QBT_SID_"))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
 }
 
 impl DownloaderClient {
@@ -61,7 +74,7 @@ impl DownloaderClient {
         Self {
             conn,
             http,
-            qb_cookie: None,
+            qb_session: None,
         }
     }
 
@@ -119,7 +132,7 @@ impl DownloaderClient {
                         return true;
                     }
                 }
-                if self.qb_cookie.is_none() && self.qb_login().await.is_err() {
+                if self.qb_session.is_none() && self.qb_login().await.is_err() {
                     return false;
                 }
                 let url = format!("{}/api/v2/torrents/add", self.base_url());
@@ -206,30 +219,27 @@ impl DownloaderClient {
         if !resp.status().is_success() {
             return Err(EngineError::DownloaderConnect);
         }
-        // SID 在 Set-Cookie
-        let sid = resp
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .find_map(|v| {
-                let s = v.to_str().ok()?;
-                let sid = s.strip_prefix("SID=")?;
-                Some(sid.split(';').next().unwrap_or(sid).to_string())
-            });
-        match sid {
+        // 会话 cookie 在 Set-Cookie：qB ≤4.x 是 `SID`，5.x 起是 `QBT_SID_<端口>`
+        let session = parse_qb_session(
+            resp.headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        );
+        match session {
             Some(s) => {
-                self.qb_cookie = Some(s);
+                self.qb_session = Some(s);
                 Ok(())
             }
             None => Err(EngineError::DownloaderConnect),
         }
     }
 
-    fn qb_auth(&self) -> Option<(&str, reqwest::header::HeaderValue)> {
-        self.qb_cookie
-            .as_ref()
-            .and_then(|sid| reqwest::header::HeaderValue::from_str(sid).ok())
-            .map(|hv| ("SID", hv))
+    /// qB 鉴权头：`Cookie: <会话名>=<值>`（4.x / 5.x 通用写法）。
+    fn qb_auth(&self) -> Option<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
+        let (name, value) = self.qb_session.as_ref()?;
+        let header = reqwest::header::HeaderValue::from_str(&format!("{name}={value}")).ok()?;
+        Some((reqwest::header::COOKIE, header))
     }
 
     /// qB 添加种子：文件路径形式（skip_checking 即 Python skip_hash_check / seedMode）。
@@ -240,7 +250,7 @@ impl DownloaderClient {
         auto_start: bool,
         tag: Option<&str>,
     ) -> Result<AddResult, EngineError> {
-        if self.qb_cookie.is_none() {
+        if self.qb_session.is_none() {
             self.qb_login().await?;
         }
         let url = format!("{}/api/v2/torrents/add", self.base_url());
@@ -425,5 +435,25 @@ mod tests {
             DownloaderKind::Transmission
         );
         assert!(DownloaderKind::from_type("aria2").is_err());
+    }
+
+    #[test]
+    fn qb_session_cookie_v4_and_v5() {
+        // qB ≤4.x：SID=<值>
+        let v4 = parse_qb_session(["SID=abc123; HttpOnly; path=/", "other=1"].into_iter());
+        assert_eq!(v4, Some(("SID".to_string(), "abc123".to_string())));
+
+        // qB 5.x：QBT_SID_<端口>=<值>（实测 qB 5.3.0 登录返回 204 + 该 cookie）
+        let v5 = parse_qb_session(
+            ["QBT_SID_9091=C9xAiq+7x4A; HttpOnly; expires=Tue, 17-Nov-2026 14:00:24 GMT; path=/"]
+                .into_iter(),
+        );
+        assert_eq!(
+            v5,
+            Some(("QBT_SID_9091".to_string(), "C9xAiq+7x4A".to_string()))
+        );
+
+        // 无会话 cookie（登录失败）→ None
+        assert_eq!(parse_qb_session(["foo=bar"].into_iter()), None);
     }
 }

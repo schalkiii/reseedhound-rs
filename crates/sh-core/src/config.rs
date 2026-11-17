@@ -30,7 +30,10 @@ pub mod defaults {
     pub const SCHEDULER_INTERVAL_MINUTES: f64 = 360.0;
     pub const SCHEDULER_STARTUP_DELAY: f64 = 0.0;
     pub const SCHEDULER_RUN_ON_START: bool = true;
+    pub const DL_TYPE: &str = "qbittorrent";
     pub const DL_TORRENT_DIR: &str = "";
+    pub const DL_PORT: u16 = 8080;
+    pub const DL_USERNAME: &str = "admin";
     pub const DL_SKIP_HASH_CHECK: bool = true;
     pub const DL_AUTO_START: bool = true;
     pub const DL_TAG: &str = "SeedHound";
@@ -467,10 +470,13 @@ impl Config {
             dl_type: section
                 .dl_type
                 .clone()
-                .unwrap_or_else(|| "qbittorrent".to_string()),
+                .unwrap_or_else(|| defaults::DL_TYPE.to_string()),
             host: section.host.clone()?,
-            port: section.port.unwrap_or(8080),
-            username: section.username.clone().unwrap_or_else(|| "admin".to_string()),
+            port: section.port.unwrap_or(defaults::DL_PORT),
+            username: section
+                .username
+                .clone()
+                .unwrap_or_else(|| defaults::DL_USERNAME.to_string()),
             password: section.password.clone().unwrap_or_default(),
         })
     }

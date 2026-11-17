@@ -11,6 +11,87 @@
 
 use std::path::{Path, PathBuf};
 
+use sh_core::config::defaults;
+
+// ---------- 标量编解码（读写必须对称） ----------
+
+/// YAML 标量 → 表单字符串。
+///
+/// YAML 会把 `port: 8090` 解析成整数、`tag: true` 解析成布尔；只认 `as_str()`
+/// 会让 GUI 显示为空，并在下一次保存时把该字段写成空值（实测会把 qB 端口清空）。
+fn scalar_text(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(text) => Some(text.clone()),
+        serde_yaml::Value::Number(number) => Some(number.to_string()),
+        serde_yaml::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+/// 表单字符串 → YAML 标量字面量（字符串字段专用）。
+///
+/// 需要引号时必须显式加：否则 `password: 1357924` 会被读回成整数，
+/// `Config::load` 直接报 `invalid type: integer ..., expected a string`。
+fn yaml_scalar(text: &str) -> String {
+    if text.is_empty() {
+        return "\"\"".to_string();
+    }
+    if plain_safe(text) {
+        text.to_string()
+    } else {
+        format!("\"{}\"", escape_double_quoted(text))
+    }
+}
+
+/// 能否不加引号直接作为 YAML 纯量（plain scalar）。
+fn plain_safe(text: &str) -> bool {
+    let Some(first) = text.chars().next() else {
+        return false;
+    };
+    // 首字符是 YAML 指示符时纯量有歧义（`-` 列表、`#` 注释、`*` 别名…）
+    if "-?:,[]{}#&*!|>'\"%@`".contains(first) || first.is_whitespace() {
+        return false;
+    }
+    if text.chars().last().is_some_and(|c| c.is_whitespace()) || text.ends_with(':') {
+        return false;
+    }
+    // 控制字符、反斜杠（Windows 路径）、`: ` 与 ` #` 一律走双引号，避免歧义
+    if text.chars().any(|c| c.is_control() || c == '\\') {
+        return false;
+    }
+    if text.contains(": ") || text.contains(" #") {
+        return false;
+    }
+    !parses_as_non_string(text)
+}
+
+/// 会被 YAML 解析成数字 / 布尔 / null 的字面量。
+fn parses_as_non_string(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    matches!(
+        lowered.as_str(),
+        "true" | "false" | "yes" | "no" | "on" | "off" | "null" | "~" | ".inf" | "-.inf" | "+.inf" | ".nan"
+    ) || text.parse::<i64>().is_ok()
+        || text.parse::<u64>().is_ok()
+        || text.parse::<f64>().is_ok()
+}
+
+fn escape_double_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
 /// 就地更新或补建 `key: value` 行（顶层标量键）。
 #[cfg(test)]
 fn upsert_top_key(content: &str, key: &str, value: &str) -> String {
@@ -41,8 +122,9 @@ fn upsert_top_key(content: &str, key: &str, value: &str) -> String {
 /// 顶层块（如 `downloader:`）内就地更新或补建字段行。
 ///
 /// `field` 形如 `host` / `port`；`section` 形如 `downloader`。
-/// 策略：定位到 `section:` 行后，在块内（下一个缩进更小或同级的顶层键前）
-/// 找 field 行就地改；找不到则插到块内第一行前（保持块紧凑）。
+/// 策略：定位 `section:` 行后，在块内（下一个缩进更小或同级的顶层键前）
+/// 找**一级字段**行就地改；找不到则补到块内最后一条一级字段之后。
+/// 只认一级缩进，避免把 `downloader.source.port` 当成 `downloader.port` 覆盖。
 fn upsert_section_field(content: &str, section: &str, field: &str, value: &str) -> String {
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let section_prefix = format!("{section}:");
@@ -59,44 +141,56 @@ fn upsert_section_field(content: &str, section: &str, field: &str, value: &str) 
         lines.push(format!("  {field}: {value}"));
         return lines.join("\n") + "\n";
     };
+    // 行内空值形式（`downloader: {}` / `downloader: null`）先展开成块，否则补行会非法
+    let inline = lines[sec_idx].trim_start()[section_prefix.len()..].trim_start();
+    if inline.starts_with('{') || inline == "null" || inline == "~" {
+        lines[sec_idx] = format!("{section}:");
+    }
 
-    // 2. 在块内找 field 行（块内 = 缩进 > 0 且未遇到下一个顶层键）
-    let mut insert_at = None;
-    let mut field_idx = None;
+    // 2. 块边界 = 下一个缩进 0 的非空非注释行
+    let mut block_end = lines.len();
     for (i, line) in lines.iter().enumerate().skip(sec_idx + 1) {
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let indent = line.len() - line.trim_start().len();
-        if indent == 0 {
-            // 到下一个顶层键了，块结束
-            insert_at = Some(i);
+        if line.len() == trimmed.len() {
+            block_end = i;
             break;
         }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&field_prefix) {
-            let rest = &trimmed[field_prefix.len()..];
+    }
+
+    // 3. 一级字段缩进 = 块内首个子行的缩进（无子行时 2）
+    let field_indent = lines[sec_idx + 1..block_end]
+        .iter()
+        .find(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .map(|l| l.len() - l.trim_start().len())
+        .unwrap_or(2);
+
+    // 4. 块内找一级 field 行（就地改），同时记住最后一条一级字段行（补行位置）
+    let mut last_direct_field = sec_idx;
+    for i in sec_idx + 1..block_end {
+        let trimmed = lines[i].trim_start().to_string();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = lines[i].len() - trimmed.len();
+        if indent != field_indent {
+            continue;
+        }
+        last_direct_field = i;
+        if let Some(rest) = trimmed.strip_prefix(&field_prefix) {
             if rest.is_empty() || rest.starts_with(' ') {
-                field_idx = Some(i);
-                break;
+                lines[i] = format!("{}{field}: {value}", " ".repeat(field_indent));
+                return lines.join("\n") + "\n";
             }
         }
     }
-    if let Some(idx) = field_idx {
-        let indent = "  ".to_string();
-        lines[idx] = format!("{indent}{field}: {value}");
-        return lines.join("\n") + "\n";
-    }
-    // 3. 补行：插到块内最后一条字段行之后（保持块紧凑）
-    let insert_pos = insert_at.unwrap_or(lines.len());
-    // 找块内最后一个非空非注释行
-    let mut last_field_line = sec_idx;
-    for (i, line) in lines.iter().enumerate().take(insert_pos).skip(sec_idx + 1) {
-        if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
-            last_field_line = i;
-        }
-    }
-    lines.insert(last_field_line + 1, format!("  {field}: {value}"));
+    // 5. 补行：插到块内最后一条一级字段之后（保持块紧凑）
+    lines.insert(last_direct_field + 1, format!("{}{field}: {value}", " ".repeat(field_indent)));
     lines.join("\n") + "\n"
 }
 
@@ -134,16 +228,18 @@ fn upsert_site_field(content: &str, name: &str, field: &str, value: &str) -> Str
         }
     }
 
-    // 块内找 field 行
-    let mut field_indent = 4usize;
+    // 块内找 field 行；字段缩进以该条目首个子行实际缩进为准
+    // （sites.yaml 既可能是 `- name:` 顶格，也可能缩进 2，混用会导致补行非法）
+    let entry_indent = lines[start].len() - lines[start].trim_start().len();
+    let mut first_field_indent: Option<usize> = None;
     for (j, line) in lines.iter().enumerate().take(end).skip(start + 1) {
         let trimmed = line.trim_start();
-        if trimmed.is_empty() || line.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let indent = line.len() - trimmed.len();
-        if indent > 2 {
-            field_indent = indent;
+        if indent > entry_indent && first_field_indent.is_none() {
+            first_field_indent = Some(indent);
         }
         if trimmed.starts_with(&field_prefix) {
             let rest = &trimmed[field_prefix.len()..];
@@ -155,14 +251,19 @@ fn upsert_site_field(content: &str, name: &str, field: &str, value: &str) -> Str
         }
     }
     // 补行：插到条目最后一条字段行之后
+    let field_indent = first_field_indent.unwrap_or(entry_indent + 2);
     lines.insert(end, format!("{}{field}: {value}", " ".repeat(field_indent)));
     lines.join("\n") + "\n"
 }
 
 /// 追加新站点到文件末尾（或 sites: 块末尾）。
-fn append_site(content: &str, name: &str, url: &str, passkey: &str, enabled: bool) -> String {    let suffix = if enabled { "true" } else { "false" };
+fn append_site(content: &str, name: &str, url: &str, passkey: &str, enabled: bool) -> String {
+    let suffix = if enabled { "true" } else { "false" };
     let entry = format!(
-        "  - name: {name}\n    url: {url}\n    passkey: {passkey}\n    enabled: {suffix}\n"
+        "  - name: {}\n    url: {}\n    passkey: {}\n    enabled: {suffix}\n",
+        yaml_scalar(name),
+        yaml_scalar(url),
+        yaml_scalar(passkey)
     );
     // 文件已有内容且以换行结尾 → 直接追加；否则补一个空行
     if content.is_empty() {
@@ -321,6 +422,25 @@ fn ensure_valid_yaml(content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// config.yaml 产物验证：语法 + 类型都要过。
+///
+/// 类型不合法意味着引擎下次启动必然失败（`invalid type: ..., expected a string`），
+/// 因此宁可拒写并回报字段，也不要把坏配置落到磁盘。
+fn ensure_valid_config(content: &str) -> anyhow::Result<()> {
+    ensure_valid_yaml(content)?;
+    serde_yaml::from_str::<sh_core::config::ConfigFile>(content)
+        .map_err(|e| anyhow::anyhow!("写回的 config.yaml 字段类型不合法（引擎会加载失败）: {e}"))?;
+    Ok(())
+}
+
+/// sites.yaml 产物验证：语法 + 类型。
+fn ensure_valid_sites(content: &str) -> anyhow::Result<()> {
+    ensure_valid_yaml(content)?;
+    serde_yaml::from_str::<sh_core::config::SitesFile>(content)
+        .map_err(|e| anyhow::anyhow!("写回的 sites.yaml 字段类型不合法: {e}"))?;
+    Ok(())
+}
+
 /// GUI 编辑会话：读取时解析为表单模型，保存时逐字段写回。
 pub struct ConfigStore {
     config_path: PathBuf,
@@ -406,15 +526,28 @@ impl ConfigStore {
     /// 保存下载器表单 → config.yaml（行级写回，保留注释）。
     pub fn save_downloader(&self, form: &DownloaderForm) -> anyhow::Result<()> {
         let content = self.read_config_text()?;
+        // 类型缺省 = qbittorrent（对齐 Config::downloader_conn 的缺省语义）
+        let dl_type = match form.dl_type.trim() {
+            "" => defaults::DL_TYPE,
+            other => other,
+        };
+        // 端口是数字字段：空 = 落默认端口（引擎同样按 8080 兜底），非法值拒写
+        let port = match form.port.trim() {
+            "" => defaults::DL_PORT.to_string(),
+            text => text
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("端口必须是 0-65535 的数字（当前: {text}）"))?
+                .to_string(),
+        };
         let mut next = content.clone();
-        next = upsert_section_field(&next, "downloader", "type", &form.dl_type);
-        next = upsert_section_field(&next, "downloader", "host", &form.host);
-        next = upsert_section_field(&next, "downloader", "port", &form.port);
-        next = upsert_section_field(&next, "downloader", "username", &form.username);
-        next = upsert_section_field(&next, "downloader", "password", &form.password);
-        next = upsert_section_field(&next, "downloader", "torrent_dir", &form.torrent_dir);
+        next = upsert_section_field(&next, "downloader", "type", &yaml_scalar(dl_type));
+        next = upsert_section_field(&next, "downloader", "host", &yaml_scalar(form.host.trim()));
+        next = upsert_section_field(&next, "downloader", "port", &port);
+        next = upsert_section_field(&next, "downloader", "username", &yaml_scalar(form.username.trim()));
+        next = upsert_section_field(&next, "downloader", "password", &yaml_scalar(&form.password));
+        next = upsert_section_field(&next, "downloader", "torrent_dir", &yaml_scalar(form.torrent_dir.trim()));
         if !form.tag.trim().is_empty() {
-            next = upsert_section_field(&next, "downloader", "tag", form.tag.trim());
+            next = upsert_section_field(&next, "downloader", "tag", &yaml_scalar(form.tag.trim()));
         }
         if let Some(skip) = form.skip_hash_check {
             let v = if skip { "true" } else { "false" };
@@ -424,7 +557,7 @@ impl ConfigStore {
             let v = if auto { "true" } else { "false" };
             next = upsert_section_field(&next, "downloader", "auto_start", v);
         }
-        ensure_valid_yaml(&next)?;
+        ensure_valid_config(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
@@ -447,41 +580,51 @@ impl ConfigStore {
             if !exists {
                 next = append_site(&next, &site.name, &site.url, &site.passkey, site.enabled);
             }
-            next = upsert_site_field(&next, &site.name, "url", &site.url);
-            next = upsert_site_field(&next, &site.name, "passkey", &site.passkey);
+            next = upsert_site_field(&next, &site.name, "url", &yaml_scalar(&site.url));
+            next = upsert_site_field(&next, &site.name, "passkey", &yaml_scalar(&site.passkey));
             let flag = if site.enabled { "true" } else { "false" };
             next = upsert_site_field(&next, &site.name, "enabled", flag);
             if !site.api_url.is_empty() {
-                next = upsert_site_field(&next, &site.name, "api_url", &site.api_url);
+                next = upsert_site_field(&next, &site.name, "api_url", &yaml_scalar(&site.api_url));
             }
         }
         // 移除 GUI 列表中已删除的条目
         let kept: std::collections::HashSet<&str> =
             sites.iter().filter(|s| !s.name.is_empty()).map(|s| s.name.as_str()).collect();
         next = remove_site_entries(&next, &kept);
-        ensure_valid_yaml(&next)?;
+        ensure_valid_sites(&next)?;
         std::fs::write(&self.sites_path, next)?;
         Ok(())
     }
 
     /// 保存调度设置 → config.yaml。
     pub fn save_scheduler(&self, enabled: bool, interval_minutes: f64, run_on_start: bool) -> anyhow::Result<()> {
+        if !interval_minutes.is_finite() || interval_minutes <= 0.0 {
+            anyhow::bail!("调度间隔必须是正数分钟（当前: {interval_minutes}）");
+        }
         let content = self.read_config_text()?;
         let mut next = upsert_section_field(&content, "scheduler", "enabled", if enabled { "true" } else { "false" });
-        next = upsert_section_field(&next, "scheduler", "interval_minutes", &format!("{interval_minutes}"));
+        next = upsert_section_field(&next, "scheduler", "interval_minutes", &interval_minutes.to_string());
         next = upsert_section_field(&next, "scheduler", "run_on_start", if run_on_start { "true" } else { "false" });
-        ensure_valid_yaml(&next)?;
+        ensure_valid_config(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
 
     /// 保存全局参数 → config.yaml。
     pub fn save_global(&self, concurrency: usize, batch_size: usize, mode: &str) -> anyhow::Result<()> {
+        if concurrency == 0 || batch_size == 0 {
+            anyhow::bail!("并发数与批量大小必须大于 0（当前: {concurrency} / {batch_size}）");
+        }
+        let mode = mode.trim();
+        if !matches!(mode, "pieces_hash" | "jackett" | "both") {
+            anyhow::bail!("辅种模式仅支持 pieces_hash / jackett / both（当前: {mode}）");
+        }
         let content = self.read_config_text()?;
         let mut next = upsert_section_field(&content, "global", "concurrency", &concurrency.to_string());
         next = upsert_section_field(&next, "global", "batch_size", &batch_size.to_string());
-        next = upsert_section_field(&next, "global", "mode", mode);
-        ensure_valid_yaml(&next)?;
+        next = upsert_section_field(&next, "global", "mode", &yaml_scalar(mode));
+        ensure_valid_config(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
@@ -495,9 +638,9 @@ impl ConfigStore {
         let field = |next: String, k: &str, v: &str| -> String {
             upsert_nested_field(&next, "notify", "feishu", k, v)
         };
-        next = field(next, "webhook_url", &form.webhook_url);
-        next = field(next, "secret", &form.secret);
-        ensure_valid_yaml(&next)?;
+        next = field(next, "webhook_url", &yaml_scalar(&form.webhook_url));
+        next = field(next, "secret", &yaml_scalar(&form.secret));
+        ensure_valid_config(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
@@ -508,10 +651,10 @@ impl ConfigStore {
         let mut next = content.clone();
         let flag = if form.enabled { "true" } else { "false" };
         next = upsert_section_field(&next, "cookiecloud", "enabled", flag);
-        next = upsert_section_field(&next, "cookiecloud", "url", &form.url);
-        next = upsert_section_field(&next, "cookiecloud", "uuid", &form.uuid);
-        next = upsert_section_field(&next, "cookiecloud", "password", &form.password);
-        ensure_valid_yaml(&next)?;
+        next = upsert_section_field(&next, "cookiecloud", "url", &yaml_scalar(&form.url));
+        next = upsert_section_field(&next, "cookiecloud", "uuid", &yaml_scalar(&form.uuid));
+        next = upsert_section_field(&next, "cookiecloud", "password", &yaml_scalar(&form.password));
+        ensure_valid_config(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
@@ -522,15 +665,27 @@ impl ConfigStore {
         let mut next = content.clone();
         let flag = if form.enabled { "true" } else { "false" };
         next = upsert_section_field(&next, "jackett", "enabled", flag);
-        next = upsert_section_field(&next, "jackett", "url", &form.url);
-        next = upsert_section_field(&next, "jackett", "api_key", &form.api_key);
-        if !form.concurrency.trim().is_empty() {
-            next = upsert_section_field(&next, "jackett", "concurrency", form.concurrency.trim());
+        next = upsert_section_field(&next, "jackett", "url", &yaml_scalar(&form.url));
+        next = upsert_section_field(&next, "jackett", "api_key", &yaml_scalar(&form.api_key));
+        // 数字字段：留空表示不改动，非空必须能解析，否则拒写（避免落下类型错误的 YAML）
+        let concurrency = form.concurrency.trim();
+        if !concurrency.is_empty() {
+            let parsed: usize = concurrency
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Jackett 并发数必须是正整数（当前: {concurrency}）"))?;
+            next = upsert_section_field(&next, "jackett", "concurrency", &parsed.to_string());
         }
-        if !form.timeout.trim().is_empty() {
-            next = upsert_section_field(&next, "jackett", "timeout", form.timeout.trim());
+        let timeout = form.timeout.trim();
+        if !timeout.is_empty() {
+            let parsed: f64 = timeout
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Jackett 超时必须是正数秒（当前: {timeout}）"))?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                anyhow::bail!("Jackett 超时必须是正数秒（当前: {timeout}）");
+            }
+            next = upsert_section_field(&next, "jackett", "timeout", &parsed.to_string());
         }
-        ensure_valid_yaml(&next)?;
+        ensure_valid_config(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
@@ -538,9 +693,9 @@ impl ConfigStore {
     /// 保存日志设置 → config.yaml（log.level / log.file）。
     pub fn save_log(&self, level: &str, file: &str) -> anyhow::Result<()> {
         let content = self.read_config_text()?;
-        let mut next = upsert_section_field(&content, "log", "level", level);
-        next = upsert_section_field(&next, "log", "file", file);
-        ensure_valid_yaml(&next)?;
+        let mut next = upsert_section_field(&content, "log", "level", &yaml_scalar(level));
+        next = upsert_section_field(&next, "log", "file", &yaml_scalar(file));
+        ensure_valid_config(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
@@ -556,16 +711,24 @@ impl ConfigStore {
             .iter()
             .filter_map(|entry| {
                 let name = entry.get("name")?.as_str()?.to_string();
-                let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let passkey = entry.get("passkey").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let api_url = entry.get("api_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let enabled = entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-                Some(SiteForm { name, url, passkey, api_url, enabled })
+                let text = |key: &str| -> String {
+                    entry.get(key).and_then(scalar_text).unwrap_or_default()
+                };
+                Some(SiteForm {
+                    name,
+                    url: text("url"),
+                    passkey: text("passkey"),
+                    api_url: text("api_url"),
+                    enabled: entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                })
             })
             .collect())
     }
 
     /// 解析 config.yaml 的 downloader 块为表单模型。
+    ///
+    /// 标量用 `scalar_text` 读取（YAML 里 `port: 8090` 是整数，只认 `as_str`
+    /// 会让端口在 GUI 里显示为空，保存时再被写成空值）。
     pub fn load_downloader_form(&self) -> anyhow::Result<DownloaderForm> {
         let text = self.read_config_text()?;
         let parsed: serde_yaml::Value = serde_yaml::from_str(&text)?;
@@ -573,9 +736,8 @@ impl ConfigStore {
             parsed
                 .get("downloader")
                 .and_then(|d| d.get(k))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+                .and_then(scalar_text)
+                .unwrap_or_default()
         };
         let flag = |k: &str| -> Option<bool> {
             parsed
@@ -583,11 +745,24 @@ impl ConfigStore {
                 .and_then(|d| d.get(k))
                 .and_then(|v| v.as_bool())
         };
+        // 数值/枚举缺省值按引擎生效值显示，避免"表单空白但实际在跑默认值"
+        let dl_type = match get("type") {
+            t if t.is_empty() => defaults::DL_TYPE.to_string(),
+            t => t,
+        };
+        let port = match get("port") {
+            p if p.is_empty() => defaults::DL_PORT.to_string(),
+            p => p,
+        };
+        let username = match get("username") {
+            u if u.is_empty() => defaults::DL_USERNAME.to_string(),
+            u => u,
+        };
         Ok(DownloaderForm {
-            dl_type: get("type"),
+            dl_type,
             host: get("host"),
-            port: get("port"),
-            username: get("username"),
+            port,
+            username,
             password: get("password"),
             torrent_dir: get("torrent_dir"),
             tag: get("tag"),
@@ -601,11 +776,7 @@ impl ConfigStore {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&self.read_config_text()?)?;
         let block = parsed.get("notify").and_then(|n| n.get("feishu"));
         let get = |k: &str| -> String {
-            block
-                .and_then(|b| b.get(k))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+            block.and_then(|b| b.get(k)).and_then(scalar_text).unwrap_or_default()
         };
         Ok(FeishuForm {
             webhook_url: get("webhook_url"),
@@ -622,11 +793,7 @@ impl ConfigStore {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let get = |k: &str| -> String {
-            block
-                .and_then(|b| b.get(k))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+            block.and_then(|b| b.get(k)).and_then(scalar_text).unwrap_or_default()
         };
         Ok(CookieCloudForm {
             enabled,
@@ -645,20 +812,12 @@ impl ConfigStore {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let get_str = |k: &str| -> String {
-            block
-                .and_then(|b| b.get(k))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+            block.and_then(|b| b.get(k)).and_then(scalar_text).unwrap_or_default()
         };
         let get_num = |k: &str, d: &str| -> String {
             block
                 .and_then(|b| b.get(k))
-                .and_then(|v| {
-                    v.as_i64()
-                        .map(|n| n.to_string())
-                        .or_else(|| v.as_f64().map(|f| f.to_string()))
-                })
+                .and_then(scalar_text)
                 .unwrap_or_else(|| d.to_string())
         };
         Ok(JackettForm {
@@ -677,9 +836,8 @@ impl ConfigStore {
         let get = |k: &str, d: &str| -> String {
             block
                 .and_then(|b| b.get(k))
-                .and_then(|v| v.as_str())
-                .unwrap_or(d)
-                .to_string()
+                .and_then(scalar_text)
+                .unwrap_or_else(|| d.to_string())
         };
         Ok((get("level", "INFO"), get("file", "logs/reseed.log")))
     }
@@ -813,5 +971,143 @@ sites:
         let next = remove_site_entries(SAMPLE_SITES, &kept);
         assert!(next.contains("siteA"));
         assert!(next.contains("siteB"));
+    }
+
+    // ---------- 回归：数值标量显示 / 写回类型 / 缩进 ----------
+
+    fn tmp_store(tag: &str, config: &str, sites: &str) -> ConfigStore {
+        let dir = std::env::temp_dir().join(format!("sh_cfgstore_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        let sites_path = dir.join("sites.yaml");
+        std::fs::write(&config_path, config).unwrap();
+        std::fs::write(&sites_path, sites).unwrap();
+        ConfigStore::new(&config_path, &sites_path)
+    }
+
+    #[test]
+    fn yaml_scalar_quotes_only_when_needed() {
+        assert_eq!(yaml_scalar("SeedHound"), "SeedHound");
+        assert_eq!(yaml_scalar("https://a.com"), "https://a.com");
+        assert_eq!(yaml_scalar("192.168.10.111"), "192.168.10.111");
+        assert_eq!(yaml_scalar("1357924"), "\"1357924\"");
+        assert_eq!(yaml_scalar("true"), "\"true\"");
+        assert_eq!(yaml_scalar(""), "\"\"");
+        assert_eq!(yaml_scalar(r"C:\CommonTools\x"), "\"C:\\\\CommonTools\\\\x\"");
+        assert_eq!(yaml_scalar("a: b"), "\"a: b\"");
+        assert_eq!(yaml_scalar("#x"), "\"#x\"");
+        // 往返：任意字符串经 yaml_scalar 后必须解析回原值
+        for text in ["1357924", "0.5", "007", "null", "~", "a#b", "x: y", r"C:\p\q", "  pad", ""] {
+            let doc = format!("k: {}", yaml_scalar(text));
+            let value: serde_yaml::Value = serde_yaml::from_str(&doc).unwrap();
+            assert_eq!(value["k"].as_str(), Some(text), "roundtrip failed: {text:?}");
+        }
+    }
+
+    #[test]
+    fn numeric_port_is_shown_in_form() {
+        let store = tmp_store(
+            "numport",
+            "downloader:\n  type: qbittorrent\n  host: 192.168.10.111\n  port: 8090\n",
+            "sites: []\n",
+        );
+        let form = store.load_downloader_form().unwrap();
+        // YAML 会把 8090 解析成整数：只认 as_str 时这里会是空串（旧缺陷）
+        assert_eq!(form.port, "8090");
+        assert_eq!(form.dl_type, "qbittorrent");
+        assert_eq!(form.username, "admin"); // 缺省值按引擎生效值显示
+    }
+
+    #[test]
+    fn numeric_strings_survive_roundtrip() {
+        let store = tmp_store(
+            "numstr",
+            "downloader:\n  type: qbittorrent\n  host: 192.168.10.111\n  port: 8090\n  \
+             username: 1357924\n  password: \"1357924\"\n  \
+             torrent_dir: C:\\CommonTools\\qBittorrent\\BT_backup\n",
+            "sites: []\n",
+        );
+        let form = store.load_downloader_form().unwrap();
+        assert_eq!(form.username, "1357924");
+        assert_eq!(form.password, "1357924");
+        assert_eq!(form.torrent_dir, r"C:\CommonTools\qBittorrent\BT_backup");
+
+        store.save_downloader(&form).unwrap();
+        let saved = store.read_config_text().unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+        // 写回后仍是字符串（旧缺陷写成 `password: 1357924` → Config::load 报
+        // invalid type: integer ..., expected a string）
+        assert_eq!(parsed["downloader"]["password"].as_str(), Some("1357924"));
+        assert_eq!(parsed["downloader"]["username"].as_str(), Some("1357924"));
+        assert_eq!(parsed["downloader"]["port"].as_u64(), Some(8090));
+        assert_eq!(
+            parsed["downloader"]["torrent_dir"].as_str(),
+            Some(r"C:\CommonTools\qBittorrent\BT_backup")
+        );
+        // 产物必须能被强类型配置解析
+        serde_yaml::from_str::<sh_core::config::ConfigFile>(&saved).unwrap();
+    }
+
+    #[test]
+    fn invalid_port_is_rejected_without_touching_disk() {
+        let store = tmp_store("badport", "downloader:\n  host: h\n  port: 8090\n", "sites: []\n");
+        let before = store.read_config_text().unwrap();
+        let mut form = store.load_downloader_form().unwrap();
+        form.port = "70000".into();
+        assert!(store.save_downloader(&form).is_err());
+        assert_eq!(store.read_config_text().unwrap(), before);
+    }
+
+    #[test]
+    fn empty_port_falls_back_to_default() {
+        let store = tmp_store("emptyport", "downloader:\n  host: h\n  port: \n", "sites: []\n");
+        let form = store.load_downloader_form().unwrap();
+        assert_eq!(form.port, defaults::DL_PORT.to_string());
+        store.save_downloader(&form).unwrap();
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&store.read_config_text().unwrap()).unwrap();
+        assert_eq!(parsed["downloader"]["port"].as_u64(), Some(u64::from(defaults::DL_PORT)));
+    }
+
+    #[test]
+    fn section_write_ignores_nested_roles() {
+        // 双下载器配置：source/destination 里的 port 不能被根级 port 覆盖
+        let config = "downloader:\n  source:\n    host: 10.0.0.1\n    port: 1111\n  \
+                      destination:\n    host: 10.0.0.2\n    port: 2222\n  host: 10.0.0.3\n  port: 3333\n";
+        let next = upsert_section_field(config, "downloader", "port", "9999");
+        let value: serde_yaml::Value = serde_yaml::from_str(&next).unwrap();
+        assert_eq!(value["downloader"]["port"].as_u64(), Some(9999));
+        assert_eq!(value["downloader"]["source"]["port"].as_u64(), Some(1111));
+        assert_eq!(value["downloader"]["destination"]["port"].as_u64(), Some(2222));
+    }
+
+    #[test]
+    fn site_missing_enabled_gets_sibling_indent() {
+        // sites.yaml 顶格 `- name:`（Python 版导出格式）：补 enabled 必须与同级字段同缩进，
+        // 否则写成 4 空格缩进会让整个 YAML 非法（旧缺陷：保存直接报错）
+        let sites = "sites:\n- name: example\n  url: https://pt.soulvoice.club\n  \
+                     passkey: deadbeefdeadbeefdeadbeefdeadbeef\n  download_interval: 10\n";
+        let store = tmp_store("siteindent", "downloader:\n  host: h\n", sites);
+        let forms = store.load_sites_form().unwrap();
+        assert_eq!(forms.len(), 1);
+        store.save_sites(&forms).unwrap();
+        let saved = store.read_sites_text().unwrap();
+        assert!(saved.contains("\n  enabled: true"), "unexpected yaml:\n{saved}");
+        assert!(saved.contains("download_interval: 10"));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+        assert_eq!(parsed["sites"].as_sequence().unwrap().len(), 1);
+        serde_yaml::from_str::<sh_core::config::SitesFile>(&saved).unwrap();
+    }
+
+    #[test]
+    fn site_numeric_passkey_stays_string() {
+        let sites = "sites:\n  - name: numpass\n    url: https://a.com\n    passkey: 12345678\n";
+        let store = tmp_store("sitepass", "downloader:\n  host: h\n", sites);
+        let forms = store.load_sites_form().unwrap();
+        assert_eq!(forms[0].passkey, "12345678");
+        store.save_sites(&forms).unwrap();
+        let saved = store.read_sites_text().unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+        assert_eq!(parsed["sites"][0]["passkey"].as_str(), Some("12345678"));
     }
 }
