@@ -1,0 +1,22 @@
+[package]
+name = "sh-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "reseedhound-gui"
+path = "src/main.rs"
+
+[dependencies]
+sh-core = { path = "../sh-core" }
+sh-engine = { path = "../sh-engine" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tray-icon = "0.26"
+gpui = "0.2"
+serde.workspace = true
+serde_yaml.workspace = true
+unicode-segmentation = "1.12"

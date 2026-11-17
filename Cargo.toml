@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sh-core",
+    "crates/sh-engine",
+    "crates/sh-cli",
+    "crates/sh-app", "target/dbg",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "multipart"] }
+anyhow = "1"
+thiserror = "1"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+url = "2"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aes = "0.8"
+cbc = "0.1"
+md-5 = "0.10"
+base64 = "0.22"
+quick-xml = "0.36"
+rand = "0.8"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
