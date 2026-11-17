@@ -418,7 +418,11 @@ impl gpui::Element for TextElement {
         };
 
         let (display_text, text_color): (SharedString, gpui::Hsla) = if display_text.is_empty() {
-            (input.placeholder.clone(), rgba(0xffffff40).into())
+            // placeholder 用主题次要文本色（0x8b93a7），原 25% 白在深底上太暗
+            (
+                input.placeholder.clone(),
+                crate::theme::TEXT_DIM.into(),
+            )
         } else {
             (display_text, style.color)
         };
@@ -515,6 +519,9 @@ impl gpui::Render for TextInput {
         use gpui::InteractiveElement as _;
         use gpui::ParentElement as _;
         use gpui::Styled as _;
+        // 正文颜色在此处固定为主题主文本色：TextElement 读的是继承的 text style，
+        // 各调用方（settings/wizard）只给 label 设色，不设置则回落 GPUI 默认黑色，
+        // 深色输入框背景下不可读。
         div()
             .flex()
             .key_context("TextInput")
@@ -538,6 +545,7 @@ impl gpui::Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .line_height(px(24.))
             .text_size(px(13.))
+            .text_color(crate::theme::TEXT)
             .w_full()
             .px_2()
             .py_1()

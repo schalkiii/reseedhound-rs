@@ -4,7 +4,7 @@ members = [
     "crates/sh-core",
     "crates/sh-engine",
     "crates/sh-cli",
-    "crates/sh-app", "target/dbg",
+    "crates/sh-app",
 ]
 
 [workspace.package]
