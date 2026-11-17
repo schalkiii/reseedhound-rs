@@ -131,7 +131,20 @@ pub fn scan_directory(dir: &str) -> anyhow::Result<Vec<TorrentInfo>> {
         .collect();
     tracing::info!("发现 {} 个种子文件", files.len());
 
-    let results: Vec<Option<TorrentInfo>> = files.par_iter().map(|p| parse_file(p)).collect();
+    // 解析进度：4 万级目录耗时可达数十秒，每 5000 个报一行
+    let total = files.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<Option<TorrentInfo>> = files
+        .par_iter()
+        .map(|p| {
+            let info = parse_file(p);
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_multiple_of(5000) || n == total {
+                tracing::info!("[阶段1] 解析进度 {n}/{total}");
+            }
+            info
+        })
+        .collect();
     Ok(results.into_iter().flatten().collect())
 }
 

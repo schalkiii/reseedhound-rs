@@ -7,6 +7,9 @@
 # 运行时日志
 /logs
 
+# 本地部署目录（exe + 含密钥配置 + 运行数据，严禁入库）
+/deploy
+
 # 本地配置（含 passkey/api_key/cookie，严禁入库）
 config.yaml
 sites.yaml

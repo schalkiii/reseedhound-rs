@@ -52,6 +52,30 @@ pub struct AddResult {
     pub info_hashes: Vec<String>,
 }
 
+/// 判定 `torrents/add` 是否被 qB 受理（对齐 Python `_is_add_success`）。
+///
+/// qB 的返回体随版本而变：WebAPI v2.14.0（qB 5.2）起是 JSON 计数
+/// （success_count / failure_count / pending_count），旧版才是纯文本 "Ok."；
+/// 一条都没加进去时服务端返回 409。只看 HTTP 2xx 会把 5.2+ 上的
+/// 「200 + failure_count」当成成功——辅种被记成功、qB 里却没有，且下载配额已消耗。
+fn is_qb_add_success(status: reqwest::StatusCode, body: &str) -> bool {
+    if !status.is_success() {
+        return false;
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() || trimmed == "Ok." {
+        return true;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(obj) = v.as_object() {
+            let count = |k: &str| obj.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+            return count("success_count") + count("pending_count") > 0;
+        }
+        return false;
+    }
+    false
+}
+
 /// 从 Set-Cookie 头提取 qB 会话 cookie。
 ///
 /// qB ≤4.x 用 `SID=<值>`，5.x 起改名为 `QBT_SID_<WebUI 端口>=<值>`；
@@ -162,7 +186,11 @@ impl DownloaderClient {
                     req = req.header(name, value);
                 }
                 match req.send().await {
-                    Ok(r) => r.status().is_success(),
+                    Ok(r) => {
+                        let status = r.status();
+                        let body = r.text().await.unwrap_or_default();
+                        is_qb_add_success(status, &body)
+                    }
                     Err(_) => false,
                 }
             }
@@ -288,10 +316,12 @@ impl DownloaderClient {
             .send()
             .await
             .map_err(|_| EngineError::DownloaderConnect)?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !is_qb_add_success(status, &body) {
             return Err(EngineError::DownloaderConnect);
         }
-        // qB add 接口返回 "Ok."，无 hash；用解析 info_hash 由调用方提供
+        // qB add 接口不返回 hash；用解析 info_hash 由调用方提供
         Ok(AddResult {
             info_hashes: vec![],
         })
@@ -435,6 +465,32 @@ mod tests {
             DownloaderKind::Transmission
         );
         assert!(DownloaderKind::from_type("aria2").is_err());
+    }
+
+    #[test]
+    fn qb_add_success_matches_qb_response_variants() {
+        use reqwest::StatusCode;
+        // 旧版纯文本 "Ok." / 空响应体
+        assert!(is_qb_add_success(StatusCode::OK, "Ok."));
+        assert!(is_qb_add_success(StatusCode::OK, ""));
+        // qB 5.2+ JSON 计数
+        assert!(is_qb_add_success(
+            StatusCode::OK,
+            r#"{"success_count":1,"failure_count":0,"pending_count":0}"#
+        ));
+        assert!(is_qb_add_success(
+            StatusCode::OK,
+            r#"{"success_count":0,"failure_count":0,"pending_count":2}"#
+        ));
+        // 200 但一条都没加进去（Python 语义：失败）
+        assert!(!is_qb_add_success(
+            StatusCode::OK,
+            r#"{"success_count":0,"failure_count":1,"pending_count":0}"#
+        ));
+        // 409 = 一条都没加进去
+        assert!(!is_qb_add_success(StatusCode::CONFLICT, "Ok."));
+        // 4xx 一律失败
+        assert!(!is_qb_add_success(StatusCode::BAD_REQUEST, "Ok."));
     }
 
     #[test]

@@ -683,15 +683,24 @@ impl ReseedEngine {
         // 收集
         let mut match_map: HashMap<String, Vec<(String, i64, String)>> = HashMap::new();
         let mut site_match_counts: HashMap<String, u64> = HashMap::new();
+        let total_sites = handles.len();
+        let mut sites_done = 0usize;
         for (site_name, handle) in handles {
             let (site, results, site_dl_urls) = match handle.await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("站点 {site_name} 查询异常: {e}");
                     stats.failed_sites.push(site_name.clone());
+                    sites_done += 1;
+                    tracing::info!("[阶段2] 站点进度 {sites_done}/{total_sites}");
                     continue;
                 }
             };
+            sites_done += 1;
+            tracing::info!(
+                "[阶段2] 站点进度 {sites_done}/{total_sites} · {site_name} 匹配 {}",
+                results.len()
+            );
             // 记录 HDArea 短效直链（覆盖同键以先到者为准，与 Python 一致）
             for (key, url) in site_dl_urls {
                 download_url_map.entry(key).or_insert(url);
@@ -996,6 +1005,8 @@ impl ReseedEngine {
             drop(permit);
         }
 
+        let total_entries = handles.len();
+        let mut entries_done = 0usize;
         for h in handles {
             if let Ok((failed, by_site, creds, skipped)) = h.await {
                 if skipped {
@@ -1012,6 +1023,10 @@ impl ReseedEngine {
                         .entry(site)
                         .or_insert(reason);
                 }
+            }
+            entries_done += 1;
+            if entries_done.is_multiple_of(50) || entries_done == total_entries {
+                tracing::info!("[阶段3] 进度 {entries_done}/{total_entries} 颗种子");
             }
         }
         Ok(())
