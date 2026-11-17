@@ -5534,6 +5534,7 @@ name = "sh-app"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "gpui",
  "serde",
  "serde_yaml",

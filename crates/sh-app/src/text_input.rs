@@ -52,8 +52,25 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// 密码输入框显示用的圆点遮罩占位长度。
-const MASK: &str = "••••••••••••";
+/// 密码遮罩字符（每个真实字符对应一个圆点）。
+const MASK_CHAR: char = '•';
+
+/// 内容字节下标 → 遮罩串字节下标。
+///
+/// 遮罩串与内容**按字符一一对应**，两者字节长度不同（圆点 3 字节、ASCII 1 字节），
+/// 直接把内容的字节下标喂给 `ShapedLine::x_for_index` 会落到多字节字符中间，
+/// 光标/选区位置就会错乱（旧实现用固定 12 个圆点，超过 12 字符的密码还会被截断）。
+fn mask_index(content: &str, mask: &str, byte_index: usize) -> usize {
+    let mut boundary = byte_index.min(content.len());
+    while boundary > 0 && !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let chars_before = content[..boundary].chars().count();
+    mask.char_indices()
+        .nth(chars_before)
+        .map(|(idx, _)| idx)
+        .unwrap_or(mask.len())
+}
 
 pub struct TextInput {
     pub focus_handle: FocusHandle,
@@ -405,17 +422,18 @@ impl gpui::Element for TextElement {
         let input = self.input.read(cx);
         let content = input.content.clone();
         let masked = input.masked;
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
+        let (display_text, cursor, selected_range): (SharedString, usize, Range<usize>) =
+            if masked && !content.is_empty() {
+                // 遮罩串与内容按字符一一对应，光标/选区投影到遮罩串下标
+                let mask: String = std::iter::repeat_n(MASK_CHAR, content.chars().count()).collect();
+                let cursor_index = mask_index(&content, &mask, input.cursor_offset());
+                let selection = mask_index(&content, &mask, input.selected_range.start)
+                    ..mask_index(&content, &mask, input.selected_range.end);
+                (mask.into(), cursor_index, selection)
+            } else {
+                (content.clone(), input.cursor_offset(), input.selected_range.clone())
+            };
         let style = window.text_style();
-
-        // 遮罩显示：内容非空时按内容长度截取圆点串
-        let display_text: SharedString = if masked && !content.is_empty() {
-            let n = content.chars().count();
-            MASK.chars().take(n).collect::<String>().into()
-        } else {
-            content.clone()
-        };
 
         let (display_text, text_color): (SharedString, gpui::Hsla) = if display_text.is_empty() {
             // placeholder 用最弱文字色（脚注层级，与正文拉开对比）
@@ -581,3 +599,35 @@ impl TextInput {
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::mask_index;
+
+    fn mask_for(content: &str) -> String {
+        std::iter::repeat_n('•', content.chars().count()).collect()
+    }
+
+    #[test]
+    fn mask_index_stays_on_char_boundary() {
+        // 纯 ASCII 口令：逐字符一个圆点（旧实现固定 12 个点，长口令会被截断）
+        let content = "P@ssw0rd-abcdefg1234";
+        let mask = mask_for(content);
+        assert_eq!(mask.chars().count(), content.chars().count());
+        assert_eq!(mask_index(content, &mask, 0), 0);
+        assert_eq!(mask_index(content, &mask, 3), 9); // 3 个圆点 × 3 字节
+        assert_eq!(mask_index(content, &mask, content.len()), mask.len());
+
+        // 含中文：任意字符边界的下标都必须投影到圆点边界上
+        let content = "密码abc";
+        let mask = mask_for(content);
+        for boundary in 0..=content.len() {
+            if !content.is_char_boundary(boundary) {
+                continue;
+            }
+            let projected = mask_index(content, &mask, boundary);
+            assert!(mask.is_char_boundary(projected), "非字符边界: {projected}");
+        }
+        // 越界下标按末尾处理，不 panic
+        assert_eq!(mask_index(content, &mask, 999), mask.len());
+    }
+}

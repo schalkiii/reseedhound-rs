@@ -1,8 +1,11 @@
 //! CookieCloud 客户端与站点 Cookie 同步。
 //!
-//! 对齐 Python src/network/cookiecloud.py + src/cookie_sync.py：
-//! - 加密：AES-256-CBC，key/iv 由 OpenSSL EVP_BytesToKey(MD5, Salted__) 派生
-//!   （crypto_key = md5("{uuid}-{password}")[:16]）
+//! 对齐 CookieCloud 官方算法（README「Encryption and Decryption Algorithm」）：
+//! - 口令 = `md5("{uuid}-{password}")` 十六进制**前 16 个字符**（不是 MD5 原始字节）
+//! - legacy（默认）：CryptoJS 口令模式 → OpenSSL `Salted__` 包装，
+//!   key/iv 由 EVP_BytesToKey(MD5, 口令, salt) 派生，AES-256-CBC + PKCS7
+//! - aes-128-cbc-fixed（CookieCloud ≥0.3.0）：AES-128-CBC，key = 口令的 16 个 UTF-8 字节，
+//!   IV 全 0，密文为纯 Base64（无 `Salted__` 头）
 //! - 域名匹配：逐级后缀（a.b.c → b.c / c）→ 精确 host → host 以 cookie 域结尾
 //! - 写回：serde_yaml 保持字段顺序（不 sort_keys），cookie 值双引号包裹单行
 //! - 同步失败仅告警不中断（定时模式每轮前置步骤）
@@ -10,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use aes::cipher::block_padding::Pkcs7;
 use aes::cipher::{BlockDecryptMut, KeyIvInit};
 use base64::Engine;
 use serde::Deserialize;
@@ -17,6 +21,7 @@ use sha2::Digest as _;
 use url::Url;
 
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 /// 解密后的 Cookie 条目。
 #[derive(Debug, Clone, Deserialize)]
@@ -31,7 +36,8 @@ pub struct CookieCloudClient {
     base_url: String,
     uuid: String,
     password: String,
-    crypto_key: [u8; 16],
+    /// CryptoJS 口令：`md5("{uuid}-{password}")` 十六进制前 16 位（ASCII，16 字节）
+    passphrase: String,
     http: reqwest::Client,
 }
 
@@ -39,6 +45,9 @@ pub struct CookieCloudClient {
 struct GetResponse {
     #[serde(default)]
     encrypted: String,
+    /// `legacy`（旧默认）或 `aes-128-cbc-fixed`（0.3.0 起）；缺省按密文头判断
+    #[serde(default)]
+    crypto_type: String,
 }
 
 #[derive(Deserialize)]
@@ -49,9 +58,10 @@ struct DecryptedPayload {
 
 impl CookieCloudClient {
     pub fn new(base_url: &str, uuid: &str, password: &str) -> anyhow::Result<Self> {
-        let crypto_key: [u8; 16] = {
+        let passphrase = {
             let digest = md5::Md5::digest(format!("{uuid}-{password}").as_bytes());
-            digest[..16].try_into().expect("md5 digest is 16 bytes")
+            let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            hex[..16].to_string()
         };
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
@@ -62,18 +72,19 @@ impl CookieCloudClient {
             base_url: base_url.trim().trim_end_matches('/').to_string(),
             uuid: uuid.to_string(),
             password: password.to_string(),
-            crypto_key,
+            passphrase,
             http,
         })
     }
 
-    /// EVP_BytesToKey(MD5)：key(32) + iv(16) 派生。
+    /// EVP_BytesToKey(MD5)：key(32) + iv(16) 派生（CryptoJS 口令模式同算法）。
     fn derive_key_iv(&self, salt: &[u8]) -> ([u8; 32], [u8; 16]) {
+        let passphrase = self.passphrase.as_bytes();
         let mut key_iv = Vec::with_capacity(48);
         let mut prev: Vec<u8> = Vec::new();
         while key_iv.len() < 48 {
             let mut input = prev.clone();
-            input.extend_from_slice(&self.crypto_key);
+            input.extend_from_slice(passphrase);
             input.extend_from_slice(salt);
             prev = md5::Md5::digest(&input).to_vec();
             key_iv.extend_from_slice(&prev);
@@ -83,30 +94,41 @@ impl CookieCloudClient {
         (key, iv)
     }
 
-    /// 解密 "Salted__" 前缀的 base64 密文 → JSON payload。
-    fn decrypt(&self, encrypted_b64: &str) -> anyhow::Result<DecryptedPayload> {
+    /// legacy：`Salted__` + 8 字节 salt + AES-256-CBC 密文（CryptoJS 口令模式）。
+    fn decrypt_legacy(&self, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if raw.len() < 32 || &raw[..8] != b"Salted__" {
+            anyhow::bail!("legacy 密文缺少 Salted__ 头或长度不足");
+        }
+        let (key, iv) = self.derive_key_iv(&raw[8..16]);
+        let mut buf = raw[16..].to_vec();
+        let plain = Aes256CbcDec::new(&key.into(), &iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut buf)
+            .map_err(|_| anyhow::anyhow!("PKCS7 填充非法（口令错误或密文损坏）"))?;
+        Ok(plain.to_vec())
+    }
+
+    /// aes-128-cbc-fixed：key = 16 位口令的 UTF-8 字节，IV 全 0，密文为纯 Base64。
+    fn decrypt_fixed_iv(&self, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let key = self.passphrase.as_bytes();
+        let iv = [0u8; 16];
+        let mut buf = raw.to_vec();
+        let plain = Aes128CbcDec::new(key.into(), &iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut buf)
+            .map_err(|_| anyhow::anyhow!("PKCS7 填充非法（口令错误或密文损坏）"))?;
+        Ok(plain.to_vec())
+    }
+
+    /// 解密 Base64 密文 → JSON payload（按 crypto_type 选择算法）。
+    fn decrypt(&self, encrypted_b64: &str, crypto_type: &str) -> anyhow::Result<DecryptedPayload> {
         let raw = base64::engine::general_purpose::STANDARD.decode(encrypted_b64)?;
-        if raw.len() < 16 || &raw[..8] != b"Salted__" {
-            anyhow::bail!("不支持的加密格式");
-        }
-        let salt = &raw[8..16];
-        let ciphertext = &raw[16..];
-        let (key, iv) = self.derive_key_iv(salt);
-        let mut buf = ciphertext.to_vec();
-        // PKCS#7 解填充（原地）
-        let n = buf.len();
-        if n == 0 || n % 16 != 0 {
-            anyhow::bail!("密文长度非法: {n}");
-        }
-        for chunk in buf.as_chunks_mut::<16>().0 {
-            Aes256CbcDec::new(&key.into(), &iv.into()).decrypt_block_mut(chunk.into());
-        }
-        let pad = buf[n - 1] as usize;
-        if pad == 0 || pad > 16 || pad > n || buf[n - pad..n].iter().any(|&b| b != pad as u8) {
-            anyhow::bail!("PKCS7 填充非法");
-        }
-        buf.truncate(n - pad);
-        Ok(serde_json::from_slice(&buf)?)
+        let plaintext = match crypto_type {
+            "aes-128-cbc-fixed" => self.decrypt_fixed_iv(&raw)?,
+            "legacy" => self.decrypt_legacy(&raw)?,
+            // 服务端未标类型：按 `Salted__` 头判断（旧版服务端只产出 legacy）
+            _ if raw.starts_with(b"Salted__") => self.decrypt_legacy(&raw)?,
+            _ => self.decrypt_fixed_iv(&raw)?,
+        };
+        Ok(serde_json::from_slice(&plaintext)?)
     }
 
     /// 拉取并解密全量 Cookie（域名 → Cookie 列表）。失败返回空 map + 错误日志。
@@ -126,7 +148,7 @@ impl CookieCloudClient {
             if data.encrypted.is_empty() {
                 anyhow::bail!("CookieCloud 返回数据中没有 encrypted 字段");
             }
-            let decrypted = self.decrypt(&data.encrypted)?;
+            let decrypted = self.decrypt(&data.encrypted, &data.crypto_type)?;
             let mut by_domain = HashMap::new();
             for (domain, cookies) in decrypted.cookie_data {
                 let clean = domain.trim_start_matches('.').to_string();
@@ -268,48 +290,83 @@ pub async fn sync_cookies(
 mod tests {
     use super::*;
 
-    /// 构造与 Python 相同算法的加密样本做互验。
-    fn encrypt_sample(uuid: &str, password: &str, plaintext: &str) -> String {
+    /// CryptoJS 口令：md5("{uuid}-{password}") 十六进制前 16 个字符。
+    fn passphrase_of(uuid: &str, password: &str) -> String {
+        let digest = md5::Md5::digest(format!("{uuid}-{password}").as_bytes());
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        hex[..16].to_string()
+    }
+
+    /// 构造 legacy 格式密文：CryptoJS 口令模式（Salted__ + EVP_BytesToKey(MD5) + AES-256-CBC）。
+    fn encrypt_legacy_sample(passphrase: &str, plaintext: &str) -> String {
         use aes::cipher::BlockEncryptMut;
         type Enc = cbc::Encryptor<aes::Aes256>;
-        let digest = md5::Md5::digest(format!("{uuid}-{password}").as_bytes());
-        let crypto_key: [u8; 16] = digest[..16].try_into().unwrap();
         let salt = [7u8; 8];
         let mut key_iv = Vec::new();
         let mut prev: Vec<u8> = Vec::new();
         while key_iv.len() < 48 {
             let mut input = prev.clone();
-            input.extend_from_slice(&crypto_key);
+            input.extend_from_slice(passphrase.as_bytes());
             input.extend_from_slice(&salt);
             prev = md5::Md5::digest(&input).to_vec();
             key_iv.extend_from_slice(&prev);
         }
         let key: [u8; 32] = key_iv[..32].try_into().unwrap();
         let iv: [u8; 16] = key_iv[32..48].try_into().unwrap();
-        // PKCS7 手工填充
         let pt = plaintext.as_bytes();
-        let pad = 16 - (pt.len() % 16);
-        let mut data = pt.to_vec();
-        data.extend(std::iter::repeat_n(pad as u8, pad));
-        let mut ct = data.clone();
-        for chunk in ct.as_chunks_mut::<16>().0 {
-            Enc::new(&key.into(), &iv.into()).encrypt_block_mut(chunk.into());
-        }
+        let mut buf = vec![0u8; pt.len() + 16];
+        buf[..pt.len()].copy_from_slice(pt);
+        let ct = Enc::new(&key.into(), &iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, pt.len())
+            .unwrap()
+            .to_vec();
         let mut raw = b"Salted__".to_vec();
         raw.extend_from_slice(&salt);
         raw.extend_from_slice(&ct);
         base64::engine::general_purpose::STANDARD.encode(raw)
     }
 
+    /// 构造 aes-128-cbc-fixed 密文：key = 口令 16 字节，IV 全 0，纯 Base64。
+    fn encrypt_fixed_iv_sample(passphrase: &str, plaintext: &str) -> String {
+        use aes::cipher::BlockEncryptMut;
+        type Enc = cbc::Encryptor<aes::Aes128>;
+        let key = passphrase.as_bytes();
+        let iv = [0u8; 16];
+        let pt = plaintext.as_bytes();
+        let mut buf = vec![0u8; pt.len() + 16];
+        buf[..pt.len()].copy_from_slice(pt);
+        let ct = Enc::new(key.into(), &iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, pt.len())
+            .unwrap()
+            .to_vec();
+        base64::engine::general_purpose::STANDARD.encode(ct)
+    }
+
     #[test]
-    fn decrypt_roundtrip_matches_python_scheme() {
+    fn passphrase_matches_cookiecloud_spec() {
+        // 官方算法：md5(uuid + '-' + password) 十六进制前 16 字符（ASCII，不是 MD5 原始字节）
+        assert_eq!(
+            CookieCloudClient::new("http://x", "test-uuid", "test-pass")
+                .unwrap()
+                .passphrase,
+            "e0c4589a68c8b0ec"
+        );
+        // 回归夹具：独立算出的 md5(uuid-password) 前 16 位（与 CryptoJS 一致）
+        assert_eq!(
+            passphrase_of("fixture-uuid", "fixture-password"),
+            "da25d18698f9b6fe"
+        );
+    }
+
+    #[test]
+    fn decrypt_legacy_roundtrip() {
         let uuid = "test-uuid";
         let password = "test-pass";
         let payload = r#"{"cookie_data": {"hdarea.club": [{"name": "uid", "value": "123"}, {"name": "pass", "value": "abc"}]}}"#;
-        let encrypted = encrypt_sample(uuid, password, payload);
+        let encrypted = encrypt_legacy_sample(&passphrase_of(uuid, password), payload);
 
         let client = CookieCloudClient::new("http://x", uuid, password).unwrap();
-        let decrypted = client.decrypt(&encrypted).expect("解密失败");
+        let decrypted = client.decrypt(&encrypted, "legacy").expect("解密失败");
         let cookies = &decrypted.cookie_data["hdarea.club"];
         assert_eq!(cookies.len(), 2);
         assert_eq!(cookies[0].name, "uid");
@@ -317,13 +374,31 @@ mod tests {
             CookieCloudClient::cookies_to_string(cookies),
             "uid=123; pass=abc"
         );
+        // 未标 crypto_type 时按 Salted__ 头自动识别
+        assert!(client.decrypt(&encrypted, "").is_ok());
     }
 
     #[test]
-    fn decrypt_rejects_unsalted() {
-        let client = CookieCloudClient::new("http://x", "u", "p").unwrap();
+    fn decrypt_fixed_iv_roundtrip() {
+        let uuid = "test-uuid";
+        let password = "test-pass";
+        let payload = r#"{"cookie_data": {"pt.example.org": [{"name": "sid", "value": "s1"}]}}"#;
+        let encrypted = encrypt_fixed_iv_sample(&passphrase_of(uuid, password), payload);
+        let client = CookieCloudClient::new("http://x", uuid, password).unwrap();
+        assert!(client.decrypt(&encrypted, "aes-128-cbc-fixed").is_ok());
+        // 未标类型且无 Salted__ 头 → 按 fixed IV 处理
+        assert!(client.decrypt(&encrypted, "").is_ok());
+    }
+
+    #[test]
+    fn decrypt_rejects_wrong_passphrase() {
+        let payload = r#"{"cookie_data": {}}"#;
+        let encrypted = encrypt_legacy_sample(&passphrase_of("u", "right"), payload);
+        let client = CookieCloudClient::new("http://x", "u", "wrong").unwrap();
+        assert!(client.decrypt(&encrypted, "legacy").is_err());
+        // 非密文数据同样拒绝
         let bad = base64::engine::general_purpose::STANDARD.encode(b"plaindata-not-encrypted");
-        assert!(client.decrypt(&bad).is_err());
+        assert!(client.decrypt(&bad, "").is_err());
     }
 
     #[test]

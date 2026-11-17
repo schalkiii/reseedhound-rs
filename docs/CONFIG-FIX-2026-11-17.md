@@ -75,3 +75,37 @@
 - **被抹掉的口令无法从 qB 的 PBKDF2 哈希恢复**：GUI 里重新填写，或继续使用本机免认证。
 - CookieCloud 仍报 `PKCS7 填充非法`：配置里的 `password` 与 CookieCloud 服务端不一致（配置级问题，非代码缺陷）。
 - 本机无 Windows SDK（缺 `fxc.exe`），`cargo build --release` 无法完成；本次 GUI 验证使用 debug 产物（`deploy/gui-check/`）。release 打包需在装有 SDK 的机器或安装 Windows SDK 后执行。
+
+## 6. 第二轮（同日 21:40）：CookieCloud 解密算法 + GUI 卡死/abort
+
+### 6.1 现象
+
+- 在 GUI 里改 CookieCloud 配置后应用卡死，随后进程 abort（WER `0xc0000409` / `FAST_FAIL_FATAL_APP_EXIT`）。
+- 日志固定报 `CookieCloud 获取/解密失败: PKCS7 填充非法`，但同一组 uuid/口令在别处可用。
+
+### 6.2 根因
+
+1. **口令派生错**：旧实现把 `md5("{uuid}-{password}")` 的**原始 16 字节**当作 EVP 口令。
+   CookieCloud 官方算法是取该 MD5 **十六进制串的前 16 个字符**（ASCII）当 CryptoJS 口令，
+   再由 EVP_BytesToKey(MD5, 口令, salt) 派生 key/iv 做 AES-256-CBC。
+   实测验证：对本机服务端 1 MB 密文用 `openssl enc -d -aes-256-cbc -md md5 -pass pass:<按上述规则算出的口令>` 可直接解出 JSON（cmd 环境同时验证了派生规则）。
+2. **未支持新格式**：0.3.0 起服务端返回 `crypto_type: aes-128-cbc-fixed`（key=口令 16 字节、IV 全 0、无 `Salted__` 头），旧实现只看 `Salted__`。
+3. **退出阻塞**：`on_app_quit` 在 UI 线程 `join()` 调度线程；引擎正在跑整轮（4 万种子扫描 + 站点查询）时关窗 → 窗口无响应，只能强杀，表现为「卡死 + abort」。
+
+### 6.3 修复
+
+| 项 | 位置 | 做法 |
+|---|---|---|
+| 口令派生 | `cookiecloud.rs` | `passphrase = md5_hex(uuid-password)[..16]`，EVP 循环改用该口令 |
+| 双算法 | `cookiecloud.rs` | legacy（Salted__ + AES-256-CBC）与 `aes-128-cbc-fixed`（AES-128-CBC + 零 IV）；读 `crypto_type`，缺省按密文头判断 |
+| 解填充 | `cookiecloud.rs` | 改用 `decrypt_padded_mut::<Pkcs7>()`（顺带修掉旧测试里「每块新建 cipher 导致 IV 不串链」的错误） |
+| 退出 | `main.rs` | 后台线程 join + `recv_timeout(2s)`，超时告警后继续退出 |
+| panic 自诊断 | `main.rs` | panic 钩子把位置/线程/原因追加到 `logs/panic.log`（独立文件，避免与 tracing 锁互锁） |
+| 状态锁 | `main.rs` | `lock().unwrap()` → `if let Ok`，锁中毒不再连锁 panic |
+| 遮罩输入 | `text_input.rs` | 每个字符一个圆点（旧实现固定 12 个，长口令被截断），光标/选区按字符投影到遮罩串 |
+
+### 6.4 验证
+
+- 真实服务端（本机 8082，1 MB 密文）：`sync-cookies` **同步完成 86/100 站点**。
+- GUI 实机：启动即同步成功并「已重新加载 sites 配置」；关闭窗口 `EXIT=0`，无 panic 记录（旧实现会卡在 join）。
+- 测试 88 全通过（新增 passphrase 夹值、legacy/fixed 往返、错误口令拒绝、遮罩投影），clippy 0 警告。

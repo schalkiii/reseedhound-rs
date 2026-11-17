@@ -48,6 +48,44 @@ struct DashParts {
     store: Arc<ConfigStore>,
 }
 
+/// 安装 panic 钩子：把 panic 位置与原因写进 `logs/panic.log`（追加，独立于 tracing，
+/// 避免 panic 发生在日志锁内时二次死锁）。
+///
+/// GUI 子系统下没有控制台，未安装钩子时崩溃只留下 WER `0xc0000409`，无从定位。
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "?".to_string());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string();
+        let message = if let Some(text) = info.payload().downcast_ref::<&str>() {
+            (*text).to_string()
+        } else if let Some(text) = info.payload().downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "非字符串 panic payload".to_string()
+        };
+        let line = format!(
+            "{} [PANIC] {location} thread={thread} {message}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+        eprintln!("{line}");
+        let _ = std::fs::create_dir_all("logs");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("logs/panic.log")
+        {
+            let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+            let _ = std::io::Write::flush(&mut file);
+        }
+    }));
+}
+
 impl RootView {
     fn build_dash(&mut self, parts: &DashParts, cx: &mut Context<Self>) {
         let dash = cx.new(|_| Dashboard {
@@ -78,6 +116,7 @@ fn main() {
     // 远期清理由 weekly-report --clean 负责。windows_subsystem 下控制台不可见，
     // 控制台层保留（RDP 调试时重定向可见）。
     sh_core::log_setup::setup_logging("INFO", "logs/reseed.log", 0);
+    install_panic_hook();
 
     // 双击运行时工作目录是 exe 所在目录，统一锚定到 exe 旁的 config.yaml / sites.yaml。
     let exe_dir = std::env::current_exe()
@@ -126,10 +165,11 @@ fn main() {
                         return;
                     }
                 };
-                let mut s = st.lock().unwrap();
-                s.scheduler_on = config.scheduler_enabled();
-                s.mode = config.operation_mode();
-                drop(s);
+                // 状态锁用 if let：另一线程 panic 导致锁中毒时不应再连锁 panic
+                if let Ok(mut s) = st.lock() {
+                    s.scheduler_on = config.scheduler_enabled();
+                    s.mode = config.operation_mode();
+                }
                 let trigger_rx = rx_slot.lock().unwrap().take();
                 let handle = spawn_scheduler(config, st.clone(), stop.clone(), trigger_rx);
                 *slot.lock().unwrap() = Some(handle);
@@ -192,9 +232,21 @@ fn main() {
         let _quit_subscription = cx.on_app_quit(move |_cx| {
             let _ = quit_stop.send(true);
             let _ = quit_tray.send(TrayCommand::Quit);
-            // join 调度线程（等后台 runtime 的 select 收到 stop 后退出）
-            if let Some(h) = quit_sched.lock().unwrap().take() {
-                let _ = h.join();
+            // join 调度线程（等后台 runtime 的 select 收到 stop 后退出）。
+            // 引擎一轮可能正扫几万种子/查站点，直接 join 会把 UI 线程一起冻死，
+            // 用户只能强杀进程——改为后台 join + 有上限等待。
+            if let Some(handle) = quit_sched.lock().unwrap().take() {
+                let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                std::thread::spawn(move || {
+                    let _ = handle.join();
+                    let _ = done_tx.send(());
+                });
+                if done_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_err()
+                {
+                    tracing::warn!("后台引擎本轮未结束，退出不再等待（本轮结果丢弃）");
+                }
             }
             async move {}
         });
@@ -362,15 +414,16 @@ fn spawn_scheduler(
         rt.block_on(async move {            let on_start = {
                 let bg_state = state.clone();
                 Arc::new(move |cycle: u64| {
-                    let mut s = bg_state.lock().unwrap();
-                    s.running = true;
-                    s.push_log(format!("[{cycle}] 开始辅种…"));
+                    if let Ok(mut s) = bg_state.lock() {
+                        s.running = true;
+                        s.push_log(format!("[{cycle}] 开始辅种…"));
+                    }
                 }) as Arc<dyn Fn(u64) + Send + Sync>
             };
             let on_report = {
                 let bg_state = state.clone();
                 Arc::new(move |report: &sh_engine::scheduler::CycleReport| {
-                    let mut s = bg_state.lock().unwrap();
+                    let Ok(mut s) = bg_state.lock() else { return };
                     s.running = false;
                     s.cycle = report.cycle;
                     s.total_torrents = report.total_torrents;
