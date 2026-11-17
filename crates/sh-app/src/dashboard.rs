@@ -31,6 +31,12 @@ pub struct RunState {
     /// 站点明细（最近一轮）。
     pub sites: Vec<sh_engine::scheduler::SiteCycleSummary>,
     pub log_lines: Vec<String>,
+    /// 演练模式（CLI --dry-run 对应）：只查询不添加种子。
+    pub dry_run: bool,
+    /// 最近一次工具动作（sync-cookies / check-dead / weekly-report）的结果文本。
+    pub action_result: String,
+    /// 工具动作是否正在执行。
+    pub action_running: bool,
 }
 
 impl RunState {
@@ -49,12 +55,29 @@ pub enum Page {
     Settings,
 }
 
+/// GUI 触发的后台工具动作（对齐 CLI 子命令）。
+#[derive(Debug, Clone)]
+pub enum GuiAction {
+    /// sync-cookies：从 CookieCloud 同步站点 Cookie
+    SyncCookies,
+    /// check-dead：对照 savept.icu 死亡名单（不落盘，只出建议）
+    CheckDead,
+    /// weekly-report：生成最近 7 天周报
+    WeeklyReport,
+}
+
 pub struct Dashboard {
     pub state: Arc<Mutex<RunState>>,
     pub trigger: tokio::sync::mpsc::Sender<()>,
     pub tray: std::sync::mpsc::Sender<TrayCommand>,
+    /// 工具动作通道（sync-cookies / check-dead / weekly-report）
+    pub actions: tokio::sync::mpsc::Sender<GuiAction>,
+    /// 主配置路径（工具动作读取 config.yaml 用）
+    pub config_path: String,
+    /// sites.yaml 路径
+    pub sites_path: String,
     pub page: Page,
-    /// 设置页（懒初始化）
+    /// 设置页（进入设置页时创建，离开时丢弃——保证每次从磁盘加载最新值）
     pub settings: Option<Entity<crate::settings::SettingsPage>>,
     /// 配置读写中心（设置页用）
     pub config_store: Arc<crate::config_store::ConfigStore>,
@@ -64,6 +87,11 @@ impl Dashboard {
     /// 请求立即辅种（通道满 1 则忽略，天然防连点）。
     pub fn request_run_now(&self) {
         let _ = self.trigger.try_send(());
+    }
+
+    /// 请求执行工具动作（通道满 1 则忽略，防连点）。
+    pub fn request_action(&self, action: GuiAction) {
+        let _ = self.actions.try_send(action);
     }
 
     fn metric_card(label: &str, icon: &str, value: String, color: Rgba) -> impl IntoElement + use<> {
@@ -129,6 +157,13 @@ impl Render for Dashboard {
         let s = self.state.lock().unwrap().clone();
         let (status_label, status_color) = theme::status_badge(s.running, s.scheduler_on);
         let running = s.running;
+        let dry_run = s.dry_run;
+        let action_running = s.action_running;
+        let action_result = if s.action_result.is_empty() {
+            None
+        } else {
+            Some(s.action_result.clone())
+        };
 
         div()
             .flex()
@@ -273,6 +308,124 @@ impl Render for Dashboard {
                             }),
                     ),
             )
+            // 工具动作行（对齐 CLI 子命令）+ 结果面板
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .id("act-sync-cookies")
+                                    .px_3().py_1_5()
+                                    .rounded_lg()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_DIM)
+                                    .bg(theme::SURFACE)
+                                    .border_1().border_color(theme::BORDER)
+                                    .hover(|s| s.cursor_pointer().bg(theme::SURFACE_HOVER))
+                                    .child("⟳ 同步 Cookie")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _ev, _w, _cx| {
+                                            this.request_action(GuiAction::SyncCookies);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("act-check-dead")
+                                    .px_3().py_1_5()
+                                    .rounded_lg()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_DIM)
+                                    .bg(theme::SURFACE)
+                                    .border_1().border_color(theme::BORDER)
+                                    .hover(|s| s.cursor_pointer().bg(theme::SURFACE_HOVER))
+                                    .child("☠ 死种检测")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _ev, _w, _cx| {
+                                            this.request_action(GuiAction::CheckDead);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("act-weekly-report")
+                                    .px_3().py_1_5()
+                                    .rounded_lg()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_DIM)
+                                    .bg(theme::SURFACE)
+                                    .border_1().border_color(theme::BORDER)
+                                    .hover(|s| s.cursor_pointer().bg(theme::SURFACE_HOVER))
+                                    .child("📋 生成周报")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _ev, _w, _cx| {
+                                            this.request_action(GuiAction::WeeklyReport);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("dry-run-toggle")
+                                    .px_3().py_1_5()
+                                    .rounded_lg()
+                                    .text_xs()
+                                    .bg(if dry_run { theme::YELLOW } else { theme::SURFACE })
+                                    .border_1()
+                                    .border_color(if dry_run { theme::YELLOW } else { theme::BORDER })
+                                    .text_color(if dry_run { rgb(0x1a1a1a) } else { theme::TEXT_DIM })
+                                    .hover(|s| s.cursor_pointer())
+                                    .child(if dry_run { "演练模式 ON".to_string() } else { "演练模式 OFF".to_string() })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _ev, _w, cx| {
+                                            if let Ok(mut s) = this.state.lock() {
+                                                s.dry_run = !s.dry_run;
+                                                let now_dry = s.dry_run;
+                                                s.push_log(if now_dry {
+                                                    "[演练模式] 已开启：只查询站点，不添加种子".into()
+                                                } else {
+                                                    "[演练模式] 已关闭".into()
+                                                });
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .child(if action_running {
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_DIM)
+                                    .child("执行中…")
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    )
+                    .children(action_result.map(|text| {
+                        div()
+                            .id("action-result")
+                            .max_h(px(160.))
+                            .overflow_y_scroll()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x0d1117))
+                            .border_1().border_color(theme::BORDER)
+                            .text_xs()
+                            .text_color(rgb(0x9fb0c3))
+                            .line_height(relative(1.4))
+                            .child(text)
+                    })),
+            )
             // 底部操作
             .child(
                 div()
@@ -327,9 +480,9 @@ impl Render for Dashboard {
 }
 
 impl Dashboard {
-    /// 设置页入口：内嵌 SettingsPage entity（进入时创建，保存走行级写回）。
+    /// 设置页入口：每次进入都从磁盘重建 SettingsPage（配置以磁盘为准，
+    /// 避免向导/外部修改后显示陈旧值），保存走行级写回。
     fn render_settings_entry(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // 懒初始化设置页（首次进入创建）
         if self.settings.is_none() {
             let store = self.config_store.clone();
             self.settings = Some(cx.new(|cx| crate::settings::SettingsPage::new(store, cx)));
@@ -366,11 +519,20 @@ impl Dashboard {
                                 MouseButton::Left,
                                 cx.listener(|this, _ev, _w, cx| {
                                     this.page = Page::Dashboard;
+                                    this.settings = None; // 离开时丢弃，下次进入重新从磁盘加载
                                     cx.notify();
                                 }),
                             ),
                     ),
             )
-            .child(settings)
+            .child(
+                // flex_1 + min_h_0：给 SettingsPage 一个可解析的弹性约束
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(settings),
+            )
     }
 }

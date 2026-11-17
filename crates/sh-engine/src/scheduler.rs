@@ -25,6 +25,9 @@ pub struct ReseedScheduler {
     /// config.yaml 路径（CookieCloud 同步后重建 Config 用）
     config_path: String,
     run_options: RunOptions,
+    /// 运行选项动态提供者（GUI 演练模式开关等）：每轮 run_cycle 前拉取，
+    /// 返回 None 时沿用构造时的 run_options。
+    options_provider: Option<Arc<dyn Fn() -> Option<RunOptions> + Send + Sync>>,
     stop: tokio::sync::watch::Receiver<bool>,
     trigger: Option<tokio::sync::mpsc::Receiver<()>>,
     on_report: Option<CycleReportCallback>,
@@ -68,6 +71,7 @@ impl ReseedScheduler {
             config_path: "config.yaml".to_string(),
             config,
             run_options,
+            options_provider: None,
             stop,
             trigger: None,
             on_report: None,
@@ -145,6 +149,30 @@ impl ReseedScheduler {
         self.config.scheduler_enabled()
     }
 
+    /// 更新运行选项（GUI 演练模式开关等；下一轮 run_cycle 生效）。
+    pub fn set_run_options(&mut self, options: RunOptions) {
+        self.run_options = options;
+    }
+
+    /// 注册运行选项动态提供者：每轮 run_cycle 前拉取（GUI 实时开关用）。
+    pub fn with_options_provider(
+        mut self,
+        f: Arc<dyn Fn() -> Option<RunOptions> + Send + Sync>,
+    ) -> Self {
+        self.options_provider = Some(f);
+        self
+    }
+
+    /// 当前生效的运行选项（优先 options_provider）。
+    fn effective_options(&self) -> RunOptions {
+        if let Some(provider) = &self.options_provider {
+            if let Some(opts) = provider() {
+                return opts;
+            }
+        }
+        self.run_options.clone()
+    }
+
     /// 取出手动触发通道（禁用定时调度时常驻循环自用）。
     pub fn take_trigger(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
         self.trigger.take()
@@ -168,13 +196,14 @@ impl ReseedScheduler {
             ..Default::default()
         };
         let config = self.sync_cookies_if_enabled().await;
+        let run_options = self.effective_options();
         match ReseedEngine::new(config).await {
             Ok(engine) => {
                 if let Err(e) = engine.start().await {
                     report.error = Some(format!("引擎启动失败: {e}"));
                     return report;
                 }
-                match engine.run(&self.run_options).await {
+                match engine.run(&run_options).await {
                     Ok(stats) => {
                         report.total_torrents = stats.total_torrents;
                         report.succeeded = stats.succeeded_count;

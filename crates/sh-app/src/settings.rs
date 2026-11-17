@@ -13,7 +13,9 @@ use std::sync::Arc;
 use gpui::*;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::config_store::{ConfigStore, DownloaderForm, SiteForm};
+use crate::config_store::{
+    ConfigStore, CookieCloudForm, DownloaderForm, FeishuForm, JackettForm, SiteForm,
+};
 use crate::text_input::TextInput;
 use crate::theme;
 
@@ -22,6 +24,7 @@ enum Tab {
     Downloader,
     Sites,
     Scheduler,
+    Notify,
 }
 
 pub struct SettingsPage {
@@ -34,6 +37,9 @@ pub struct SettingsPage {
     dl_user: Entity<TextInput>,
     dl_pass: Entity<TextInput>,
     dl_dir: Entity<TextInput>,
+    dl_tag: Entity<TextInput>,
+    dl_skip_hash_check: bool,
+    dl_auto_start: bool,
     // 站点列表（当前编辑态）
     sites: Vec<SiteRow>,
     // 调度 & 全局
@@ -43,6 +49,20 @@ pub struct SettingsPage {
     glob_concurrency: Entity<TextInput>,
     glob_batch: Entity<TextInput>,
     glob_mode: Entity<TextInput>,
+    // 通知（飞书）+ CookieCloud + Jackett + 日志
+    feishu_webhook: Entity<TextInput>,
+    feishu_secret: Entity<TextInput>,
+    cc_enabled: bool,
+    cc_url: Entity<TextInput>,
+    cc_uuid: Entity<TextInput>,
+    cc_pass: Entity<TextInput>,
+    jackett_enabled: bool,
+    jackett_url: Entity<TextInput>,
+    jackett_apikey: Entity<TextInput>,
+    jackett_concurrency: Entity<TextInput>,
+    jackett_timeout: Entity<TextInput>,
+    log_level: Entity<TextInput>,
+    log_file: Entity<TextInput>,
     // 状态
     status: Option<(String, bool)>, // (消息, 成功?)
 }
@@ -67,6 +87,10 @@ impl SettingsPage {
         // 从磁盘加载当前值
         let dl = store.load_downloader_form().unwrap_or_default();
         let sites = store.load_sites_form().unwrap_or_default();
+        let feishu = store.load_feishu_form().unwrap_or_default();
+        let cc = store.load_cookiecloud_form().unwrap_or_default();
+        let jackett = store.load_jackett_form().unwrap_or_default();
+        let (log_level, log_file) = store.load_log_form().unwrap_or_else(|_| ("INFO".into(), "logs/reseed.log".into()));
         let config_text = store.read_config_text().unwrap_or_default();
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&config_text).unwrap_or(serde_yaml::Value::Null);
@@ -97,6 +121,9 @@ impl SettingsPage {
             dl_user: input("用户名", &dl.username, cx),
             dl_pass: masked("密码", &dl.password, cx),
             dl_dir: input("种子目录", &dl.torrent_dir, cx),
+            dl_tag: input("SeedHound", &dl.tag, cx),
+            dl_skip_hash_check: dl.skip_hash_check.unwrap_or(true),
+            dl_auto_start: dl.auto_start.unwrap_or(true),
             sites: site_rows,
             sched_enabled: sched.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
             sched_interval: input("360", &sched.get("interval_minutes")
@@ -105,6 +132,19 @@ impl SettingsPage {
             glob_concurrency: input("20", &gget("concurrency", "20"), cx),
             glob_batch: input("100", &gget("batch_size", "100"), cx),
             glob_mode: input("pieces_hash", &gget("mode", "pieces_hash"), cx),
+            feishu_webhook: input("https://open.feishu.cn/…", &feishu.webhook_url, cx),
+            feishu_secret: masked("签名校验 secret（可空）", &feishu.secret, cx),
+            cc_enabled: cc.enabled,
+            cc_url: input("http://127.0.0.1:8082/cookie", &cc.url, cx),
+            cc_uuid: input("UUID", &cc.uuid, cx),
+            cc_pass: masked("解密密码", &cc.password, cx),
+            jackett_enabled: jackett.enabled,
+            jackett_url: input("http://localhost:9117", &jackett.url, cx),
+            jackett_apikey: masked("api_key", &jackett.api_key, cx),
+            jackett_concurrency: input("5", &jackett.concurrency, cx),
+            jackett_timeout: input("30", &jackett.timeout, cx),
+            log_level: input("INFO", &log_level, cx),
+            log_file: input("logs/reseed.log", &log_file, cx),
             status: None,
         }
     }
@@ -120,8 +160,13 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    fn tab_button(label: &str, active: bool, id: &'static str, tab: Tab) -> AnyElement {
-        let _ = tab; // 切换由 render 的 on_mouse_down 统一处理
+    fn tab_button(
+        label: &str,
+        active: bool,
+        id: &'static str,
+        tab: Tab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
             .id(id)
             .px_4().py_2()
@@ -129,8 +174,50 @@ impl SettingsPage {
             .text_sm()
             .text_color(if active { rgb(0xffffff) } else { theme::TEXT_DIM })
             .bg(if active { theme::BTN_PRIMARY } else { theme::SURFACE })
-            .hover(|s| s.cursor_pointer())
+            .border_1()
+            .border_color(if active { theme::BTN_PRIMARY } else { theme::BORDER })
+            .hover(|s| s.cursor_pointer().bg(theme::SURFACE_HOVER))
             .child(label.to_string())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _w, cx| {
+                    this.tab = tab;
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn toggle_row(
+        label: &str,
+        hint: &str,
+        on: bool,
+        id: &'static str,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .justify_between()
+            .items_center()
+            .child(
+                div().flex().flex_col().gap_1()
+                    .child(div().text_sm().text_color(theme::TEXT).child(label.to_string()))
+                    .child(div().text_xs().text_color(theme::TEXT_DIM).child(hint.to_string())),
+            )
+            .child(
+                div()
+                    .id(id)
+                    .px_3().py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(if on { theme::BTN_PRIMARY } else { theme::SURFACE })
+                    .border_1()
+                    .border_color(if on { theme::BTN_PRIMARY } else { theme::BORDER })
+                    .text_color(if on { rgb(0xffffff) } else { theme::TEXT_DIM })
+                    .hover(|s| s.cursor_pointer())
+                    .child(if on { "已启用" } else { "已禁用" })
+                    .on_mouse_down(MouseButton::Left, handler),
+            )
             .into_any_element()
     }
 
@@ -148,6 +235,37 @@ impl SettingsPage {
     }
 
     fn save_all(&mut self, cx: &mut Context<Self>) {
+        // 保存前校验（对齐 CLI 参数校验行为，坏值拒绝落盘）
+        let port = self.dl_port.read(cx).value();
+        if !port.is_empty() && port.parse::<u16>().is_err() {
+            self.status = Some((format!("端口必须是 0-65535 的数字（当前: {port}）"), false));
+            cx.notify();
+            return;
+        }
+        let interval = self.sched_interval.read(cx).value();
+        if !interval.is_empty() && interval.parse::<f64>().map_or(true, |v| v <= 0.0) {
+            self.status = Some((format!("调度间隔必须是正数分钟（当前: {interval}）"), false));
+            cx.notify();
+            return;
+        }
+        let mode = self.glob_mode.read(cx).value();
+        if !matches!(mode.as_str(), "pieces_hash" | "jackett" | "both") {
+            self.status = Some((format!("辅种模式仅支持 pieces_hash / jackett / both（当前: {mode}）"), false));
+            cx.notify();
+            return;
+        }
+        // 磁盘上的当前开关状态（用于判断调度开关是否被本次保存翻转）
+        let sched_was_enabled = self
+            .store
+            .read_config_text()
+            .ok()
+            .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok())
+            .and_then(|v| {
+                v.get("scheduler")
+                    .and_then(|s| s.get("enabled"))
+                    .and_then(|b| b.as_bool())
+            })
+            .unwrap_or(false);
         let result = (|| -> anyhow::Result<()> {
             // 下载器
             let dl = DownloaderForm {
@@ -157,6 +275,9 @@ impl SettingsPage {
                 username: self.dl_user.read(cx).value(),
                 password: self.dl_pass.read(cx).value(),
                 torrent_dir: self.dl_dir.read(cx).value(),
+                tag: self.dl_tag.read(cx).value(),
+                skip_hash_check: Some(self.dl_skip_hash_check),
+                auto_start: Some(self.dl_auto_start),
             };
             self.store.save_downloader(&dl)?;
             // 站点
@@ -170,10 +291,46 @@ impl SettingsPage {
             let concurrency: usize = self.glob_concurrency.read(cx).value().parse().unwrap_or(20);
             let batch: usize = self.glob_batch.read(cx).value().parse().unwrap_or(100);
             self.store.save_global(concurrency, batch, &self.glob_mode.read(cx).value())?;
+            // 通知 / CookieCloud / Jackett / 日志
+            let feishu = FeishuForm {
+                webhook_url: self.feishu_webhook.read(cx).value(),
+                secret: self.feishu_secret.read(cx).value(),
+            };
+            self.store.save_feishu(&feishu)?;
+            let cc = CookieCloudForm {
+                enabled: self.cc_enabled,
+                url: self.cc_url.read(cx).value(),
+                uuid: self.cc_uuid.read(cx).value(),
+                password: self.cc_pass.read(cx).value(),
+            };
+            self.store.save_cookiecloud(&cc)?;
+            let jackett = JackettForm {
+                enabled: self.jackett_enabled,
+                url: self.jackett_url.read(cx).value(),
+                api_key: self.jackett_apikey.read(cx).value(),
+                concurrency: self.jackett_concurrency.read(cx).value(),
+                timeout: self.jackett_timeout.read(cx).value(),
+            };
+            self.store.save_jackett(&jackett)?;
+            let level = self.log_level.read(cx).value();
+            let level = if level.trim().is_empty() { "INFO".to_string() } else { level };
+            let file = self.log_file.read(cx).value();
+            let file = if file.trim().is_empty() { "logs/reseed.log".to_string() } else { file };
+            self.store.save_log(&level, &file)?;
             Ok(())
         })();
+        let sched_changed = self.sched_enabled != sched_was_enabled;
         match result {
-            Ok(()) => self.status = Some(("已保存，下一轮辅种自动生效".into(), true)),
+            Ok(()) => {
+                self.status = Some(if sched_changed {
+                    (
+                        "已保存。注意：定时调度开关变更需重启程序后生效".into(),
+                        true,
+                    )
+                } else {
+                    ("已保存，下一轮辅种自动生效".into(), true)
+                })
+            }
             Err(e) => self.status = Some((format!("保存失败: {e}"), false)),
         }
         cx.notify();
@@ -188,9 +345,9 @@ impl Render for SettingsPage {
         div()
             .flex()
             .flex_col()
-            .size_full()
-            .bg(theme::BG)
-            .p_8()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .gap_5()
             // 标签栏
             .child(
@@ -198,9 +355,10 @@ impl Render for SettingsPage {
                     .flex()
                     .gap_2()
                     .children(vec![
-                        Self::tab_button("下载器", tab == Tab::Downloader, "tab-dl", Tab::Downloader),
-                        Self::tab_button("站点", tab == Tab::Sites, "tab-sites", Tab::Sites),
-                        Self::tab_button("调度与全局", tab == Tab::Scheduler, "tab-sched", Tab::Scheduler),
+                        Self::tab_button("下载器", tab == Tab::Downloader, "tab-dl", Tab::Downloader, cx),
+                        Self::tab_button("站点", tab == Tab::Sites, "tab-sites", Tab::Sites, cx),
+                        Self::tab_button("调度与全局", tab == Tab::Scheduler, "tab-sched", Tab::Scheduler, cx),
+                        Self::tab_button("通知与集成", tab == Tab::Notify, "tab-notify", Tab::Notify, cx),
                     ]),
             )
             // 内容区（滚动）
@@ -233,6 +391,27 @@ impl Render for SettingsPage {
                                     Self::field_row("密码", &self.dl_pass, None),
                                     Self::field_row("种子目录", &self.dl_dir,
                                         Some("保存后下一轮辅种生效（无需重启）")),
+                                    Self::field_row("添加种子标签（tag）", &self.dl_tag, None),
+                                    Self::toggle_row(
+                                        "跳过哈希校验",
+                                        "添加种子时 skip_checking（推荐开启）",
+                                        self.dl_skip_hash_check,
+                                        "dl-skip-hash",
+                                        cx.listener(|this, _ev, _w, cx| {
+                                            this.dl_skip_hash_check = !this.dl_skip_hash_check;
+                                            cx.notify();
+                                        }),
+                                    ),
+                                    Self::toggle_row(
+                                        "添加后自动开始",
+                                        "关闭则添加为暂停状态",
+                                        self.dl_auto_start,
+                                        "dl-auto-start",
+                                        cx.listener(|this, _ev, _w, cx| {
+                                            this.dl_auto_start = !this.dl_auto_start;
+                                            cx.notify();
+                                        }),
+                                    ),
                                 ],
                                 Tab::Sites => {
                                     let mut rows: Vec<AnyElement> = self.sites.iter().enumerate().map(|(idx, row)| {
@@ -257,6 +436,8 @@ impl Render for SettingsPage {
                                                         div().text_sm().text_color(color)
                                                             .child(format!("{dot} 站点 #{}", idx + 1)),
                                                     )
+                                            .child(
+                                                div().flex().gap_2()
                                                     .child(
                                                         div()
                                                             .id(("site-toggle", idx))
@@ -273,7 +454,25 @@ impl Render for SettingsPage {
                                                                 }
                                                                 cx.notify();
                                                             })),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(("site-del", idx))
+                                                            .px_3().py_1()
+                                                            .rounded_md()
+                                                            .text_xs()
+                                                            .text_color(theme::RED)
+                                                            .border_1().border_color(rgb(0x7f1d1d))
+                                                            .hover(|s| s.cursor_pointer().bg(rgb(0x7f1d1d)))
+                                                            .child("删除")
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                                                                if this.sites.len() > idx {
+                                                                    this.sites.remove(idx);
+                                                                }
+                                                                cx.notify();
+                                                            })),
                                                     ),
+                                            ),
                                             )
                                             .child(div().flex().gap_3()
                                                 .child(div().flex_1().child(Self::field_row("名称", &row.name, None)))
@@ -354,6 +553,52 @@ impl Render for SettingsPage {
                                     Self::field_row("站点查询并发数", &self.glob_concurrency, None),
                                     Self::field_row("API 批量大小", &self.glob_batch, None),
                                     Self::field_row("辅种模式（pieces_hash / jackett / both）", &self.glob_mode, None),
+                                    div().h_px().bg(theme::BORDER).into_any_element(),
+                                    Self::field_row("日志级别（DEBUG / INFO / WARN / ERROR）", &self.log_level,
+                                        Some("重启程序后生效")),
+                                    Self::field_row("日志文件路径", &self.log_file, None),
+                                ],
+                                Tab::Notify => vec![
+                                    // 飞书
+                                    div().text_sm().text_color(theme::TEXT).child("飞书通知").into_any_element(),
+                                    Self::field_row("Webhook URL", &self.feishu_webhook,
+                                        Some("留空则不推送")),
+                                    Self::field_row("签名校验 Secret", &self.feishu_secret, None),
+                                    div().h_px().bg(theme::BORDER).into_any_element(),
+                                    // CookieCloud
+                                    div().text_sm().text_color(theme::TEXT).child("CookieCloud 同步").into_any_element(),
+                                    Self::toggle_row(
+                                        "启用 CookieCloud",
+                                        "每轮辅种开始前自动同步站点 Cookie",
+                                        self.cc_enabled,
+                                        "cc-toggle",
+                                        cx.listener(|this, _ev, _w, cx| {
+                                            this.cc_enabled = !this.cc_enabled;
+                                            cx.notify();
+                                        }),
+                                    ),
+                                    Self::field_row("服务地址", &self.cc_url, None),
+                                    Self::field_row("UUID", &self.cc_uuid, None),
+                                    Self::field_row("解密密码", &self.cc_pass, None),
+                                    div().h_px().bg(theme::BORDER).into_any_element(),
+                                    // Jackett
+                                    div().text_sm().text_color(theme::TEXT).child("Jackett（jackett/both 模式）").into_any_element(),
+                                    Self::toggle_row(
+                                        "启用 Jackett",
+                                        "辅种模式为 jackett / both 时生效",
+                                        self.jackett_enabled,
+                                        "jackett-toggle",
+                                        cx.listener(|this, _ev, _w, cx| {
+                                            this.jackett_enabled = !this.jackett_enabled;
+                                            cx.notify();
+                                        }),
+                                    ),
+                                    Self::field_row("服务地址", &self.jackett_url, None),
+                                    Self::field_row("API Key", &self.jackett_apikey, None),
+                                    div().flex().gap_3()
+                                        .child(div().w_32().child(Self::field_row("并发数", &self.jackett_concurrency, None)))
+                                        .child(div().w_32().child(Self::field_row("超时（秒）", &self.jackett_timeout, None)))
+                                        .into_any_element(),
                                 ],
                             }),
                     ),

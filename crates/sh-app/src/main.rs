@@ -39,11 +39,15 @@ enum RootView {
 }
 
 /// 仪表盘构建材料（RootView 切换与首建共用）。
+#[derive(Clone)]
 struct DashParts {
     state: Arc<Mutex<RunState>>,
     trigger: tokio::sync::mpsc::Sender<()>,
+    actions: tokio::sync::mpsc::Sender<dashboard::GuiAction>,
     tray: std::sync::mpsc::Sender<TrayCommand>,
     store: Arc<ConfigStore>,
+    config_path: String,
+    sites_path: String,
 }
 
 impl RootView {
@@ -51,7 +55,10 @@ impl RootView {
         let dash = cx.new(|_| Dashboard {
             state: parts.state.clone(),
             trigger: parts.trigger.clone(),
+            actions: parts.actions.clone(),
             tray: parts.tray.clone(),
+            config_path: parts.config_path.clone(),
+            sites_path: parts.sites_path.clone(),
             page: dashboard::Page::Dashboard,
             settings: None,
             config_store: parts.store.clone(),
@@ -92,38 +99,47 @@ fn main() {
     let state = Arc::new(Mutex::new(RunState::default()));
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
     let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (action_tx, action_rx) = tokio::sync::mpsc::channel::<dashboard::GuiAction>(1);
     // trigger_rx 单次移交（调度线程启动时取走）
     let trigger_rx_slot = Arc::new(Mutex::new(Some(trigger_rx)));
 
     // 启动调度（只允许一次；向导完成路径与已有配置路径互斥）
-    let arm_scheduler = {
+    // scheduler_handle：调度线程 JoinHandle，退出时 join 防止 tokio runtime 与
+    // 引擎在进程 teardown 阶段继续访问已释放资源（P0：退出后后台线程仍跑数秒）。
+    let (arm_scheduler, scheduler_handle) = {
         let armed = Arc::new(Mutex::new(false));
+        let handle_slot = Arc::new(Mutex::new(None::<std::thread::JoinHandle<()>>));
         let cfg_path = config_path_str.clone();
         let sites_path = sites_path_str.clone();
         let st = state.clone();
         let stop = stop_tx.clone();
         let rx_slot = trigger_rx_slot.clone();
-        move || {
-            let mut flag = armed.lock().unwrap();
-            if *flag {
-                return;
-            }
-            *flag = true;
-            drop(flag);
-            let config = match Config::load(&cfg_path, &sites_path) {
-                Ok(c) => Arc::new(c),
-                Err(e) => {
-                    tracing::error!("配置加载失败，调度未启动: {e}");
+        let slot = handle_slot.clone();
+        (
+            Arc::new(move || {
+                let mut flag = armed.lock().unwrap();
+                if *flag {
                     return;
                 }
-            };
-            let mut s = st.lock().unwrap();
-            s.scheduler_on = config.scheduler_enabled();
-            s.mode = config.operation_mode();
-            drop(s);
-            let trigger_rx = rx_slot.lock().unwrap().take();
-            spawn_scheduler(config, st.clone(), stop.clone(), trigger_rx);
-        }
+                *flag = true;
+                drop(flag);
+                let config = match Config::load(&cfg_path, &sites_path) {
+                    Ok(c) => Arc::new(c),
+                    Err(e) => {
+                        tracing::error!("配置加载失败，调度未启动: {e}");
+                        return;
+                    }
+                };
+                let mut s = st.lock().unwrap();
+                s.scheduler_on = config.scheduler_enabled();
+                s.mode = config.operation_mode();
+                drop(s);
+                let trigger_rx = rx_slot.lock().unwrap().take();
+                let handle = spawn_scheduler(config, st.clone(), stop.clone(), trigger_rx);
+                *slot.lock().unwrap() = Some(handle);
+            }) as Arc<dyn Fn() + Send + Sync>,
+            handle_slot,
+        )
     };
 
     // 托盘（独立线程，始终常驻，与配置状态无关）
@@ -138,6 +154,37 @@ fn main() {
         });
     }
 
+    // 工具动作执行线程（对齐 CLI 子命令：sync-cookies / check-dead / weekly-report）
+    {
+        let st = state.clone();
+        let stop = stop_tx.clone();
+        let cfg_path = config_path_str.clone();
+        let sites_path = sites_path_str.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let mut stop_rx = stop.subscribe();
+            rt.block_on(async move {
+                let mut action_rx = action_rx;
+                loop {
+                    let received = tokio::select! {
+                        _ = stop_rx.changed() => None,
+                        r = action_rx.recv() => r,
+                    };
+                    let Some(action) = received else { break };
+                    if let Ok(mut s) = st.lock() {
+                        s.action_running = true;
+                    }
+                    let result = run_gui_action(&action, &cfg_path, &sites_path).await;
+                    if let Ok(mut s) = st.lock() {
+                        s.action_running = false;
+                        s.action_result = result;
+                        s.push_log(format!("[工具] {action:?} 完成"));
+                    }
+                }
+            });
+        });
+    }
+
     let has_config = config_path.exists() && sites_path.exists();
 
     Application::new().run(move |cx: &mut App| {
@@ -145,9 +192,14 @@ fn main() {
 
         let quit_stop = stop_tx.clone();
         let quit_tray = tray_tx.clone();
+        let quit_sched = scheduler_handle.clone();
         let _quit_subscription = cx.on_app_quit(move |_cx| {
             let _ = quit_stop.send(true);
             let _ = quit_tray.send(TrayCommand::Quit);
+            // join 调度线程（等后台 runtime 的 select 收到 stop 后退出）
+            if let Some(h) = quit_sched.lock().unwrap().take() {
+                let _ = h.join();
+            }
             async move {}
         });
 
@@ -159,8 +211,11 @@ fn main() {
         let dash_parts = DashParts {
             state: state.clone(),
             trigger: trigger_tx.clone(),
+            actions: action_tx.clone(),
             tray: tray_tx.clone(),
             store: store.clone(),
+            config_path: config_path_str.clone(),
+            sites_path: sites_path_str.clone(),
         };
         let arm = arm_scheduler.clone();
 
@@ -177,13 +232,16 @@ fn main() {
                 ..Default::default()
             },
             move |_window, cx| {
-                let parts = dash_parts.clone_dyn();
+                let parts = dash_parts.clone();
                 if has_config {
                     cx.new(|cx| {
                         let dash = cx.new(|_| Dashboard {
                             state: parts.state.clone(),
                             trigger: parts.trigger.clone(),
+                            actions: parts.actions.clone(),
                             tray: parts.tray.clone(),
+                            config_path: parts.config_path.clone(),
+                            sites_path: parts.sites_path.clone(),
                             page: dashboard::Page::Dashboard,
                             settings: None,
                             config_store: parts.store.clone(),
@@ -229,33 +287,87 @@ fn main() {
     });
 }
 
-/// DashParts 跨闭包克隆（字段都是 Arc/Sender，均可 clone）。
-impl DashParts {
-    fn clone_dyn(&self) -> DashParts {
-        DashParts {
-            state: self.state.clone(),
-            trigger: self.trigger.clone(),
-            tray: self.tray.clone(),
-            store: self.store.clone(),
+/// 执行 GUI 工具动作（对齐 CLI 子命令行为；结果文本回显到仪表盘）。
+async fn run_gui_action(
+    action: &dashboard::GuiAction,
+    config_path: &str,
+    sites_path: &str,
+) -> String {
+    match action {
+        dashboard::GuiAction::SyncCookies => {
+            // 参数缺省读 config.yaml（对齐 CLI sync-cookies 的缺省行为）
+            match Config::load(config_path, sites_path) {
+                Ok(config) => {
+                    let url = config.cookiecloud_url();
+                    let Some(uuid) = config.cookiecloud_uuid() else {
+                        return "✗ CookieCloud 未配置（请在 设置 → 通知与集成 填写 UUID）".into();
+                    };
+                    let password = config.cookiecloud_password().unwrap_or_default();
+                    match sh_engine::cookiecloud::sync_cookies(&url, &uuid, &password, sites_path).await {
+                        Ok(n) => format!("✓ CookieCloud 同步完成：更新 {n} 个站点 Cookie"),
+                        Err(e) => format!("✗ CookieCloud 同步失败: {e}"),
+                    }
+                }
+                Err(e) => format!("✗ 配置加载失败: {e}"),
+            }
+        }
+        dashboard::GuiAction::CheckDead => {
+            match Config::load(config_path, sites_path) {
+                Ok(config) => {
+                    let url = config.savept_url();
+                    match sh_engine::savept::fetch_dead_sites(&url, config.savept_timeout(), 5).await {
+                        Ok(dead) => {
+                            let local = sh_engine::savept::load_local_sites(sites_path, true)
+                                .unwrap_or_default();
+                            let matches = sh_engine::savept::match_local(&dead, &local);
+                            sh_engine::savept::format_report(&matches, local.len())
+                        }
+                        Err(e) => format!("✗ 死亡名单拉取失败: {e}"),
+                    }
+                }
+                Err(e) => format!("✗ 配置加载失败: {e}"),
+            }
+        }
+        dashboard::GuiAction::WeeklyReport => {
+            // 日志路径取 config.yaml log.file（缺省 logs/reseed.log），窗口 7 天
+            let log_file = Config::load(config_path, sites_path)
+                .ok()
+                .and_then(|c| {
+                    let f = c.log_file();
+                    if f.is_empty() { None } else { Some(f) }
+                })
+                .unwrap_or_else(|| "logs/reseed.log".to_string());
+            match sh_engine::weekly_report::window_start(&log_file, 7) {
+                Ok(since) => {
+                    let host_map = sh_engine::weekly_report::load_site_host_map(sites_path);
+                    match sh_engine::weekly_report::parse_log(&log_file, since, &host_map) {
+                        Ok((per_site, runs)) => {
+                            sh_engine::weekly_report::generate_report(&per_site, &runs, since)
+                        }
+                        Err(e) => format!("✗ 周报生成失败: {e}"),
+                    }
+                }
+                Err(e) => format!("✗ 日志读取失败: {e}"),
+            }
         }
     }
 }
 
 /// 拉起后台调度线程（tokio runtime + ReseedScheduler 三路 select）。
+/// 返回 JoinHandle 供退出时 join（防止 runtime 在进程 teardown 阶段访问已释放资源）。
 fn spawn_scheduler(
     config: Arc<Config>,
     state: Arc<Mutex<RunState>>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     trigger_rx: Option<tokio::sync::mpsc::Receiver<()>>,
-) {
+) -> std::thread::JoinHandle<()> {
     use sh_engine::scheduler::ReseedScheduler;
     use sh_engine::seeder::RunOptions;
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let stop_rx = stop_tx.subscribe();
-        rt.block_on(async move {
-            let on_start = {
+        rt.block_on(async move {            let on_start = {
                 let bg_state = state.clone();
                 Arc::new(move |cycle: u64| {
                     let mut s = bg_state.lock().unwrap();
@@ -292,6 +404,16 @@ fn spawn_scheduler(
             if let Some(rx) = trigger_rx {
                 scheduler = scheduler.with_trigger(rx);
             }
+            // 演练模式等运行选项以共享状态为准（GUI 可实时切换，每轮生效）
+            {
+                let state_ref = state.clone();
+                scheduler = scheduler.with_options_provider(Arc::new(move || {
+                    state_ref
+                        .lock()
+                        .ok()
+                        .map(|s| RunOptions { dry_run: s.dry_run, site_name: None })
+                }));
+            }
 
             if scheduler.scheduler_enabled() {
                 if let Err(e) = scheduler.run().await {
@@ -301,7 +423,6 @@ fn spawn_scheduler(
                 tracing::info!("定时调度未启用，常驻等待（托盘可手动触发）");
                 let mut stop_rx_inner = stop_tx.subscribe();
                 let mut trigger = scheduler.take_trigger();
-                let sched_ref = &scheduler;
                 loop {
                     tokio::select! {
                         _ = stop_rx_inner.changed() => break,
@@ -312,15 +433,15 @@ fn spawn_scheduler(
                             }
                         } => {
                             if received.is_none() { break; }
-                            let report = sched_ref.run_cycle(1).await;
+                            let report = scheduler.run_cycle(1).await;
                             if let Some(err) = &report.error {
                                 tracing::error!("{err}");
                             }
-                            sched_ref.report_to(&report);
+                            scheduler.report_to(&report);
                         }
                     }
                 }
             }
         });
-    });
+    })
 }

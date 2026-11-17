@@ -160,8 +160,7 @@ fn upsert_site_field(content: &str, name: &str, field: &str, value: &str) -> Str
 }
 
 /// 追加新站点到文件末尾（或 sites: 块末尾）。
-fn append_site(content: &str, name: &str, url: &str, passkey: &str, enabled: bool) -> String {
-    let suffix = if enabled { "true" } else { "false" };
+fn append_site(content: &str, name: &str, url: &str, passkey: &str, enabled: bool) -> String {    let suffix = if enabled { "true" } else { "false" };
     let entry = format!(
         "  - name: {name}\n    url: {url}\n    passkey: {passkey}\n    enabled: {suffix}\n"
     );
@@ -173,6 +172,143 @@ fn append_site(content: &str, name: &str, url: &str, passkey: &str, enabled: boo
     } else {
         format!("{content}\n{entry}")
     }
+}
+
+/// 从 sites.yaml 移除未保留的站点条目（整条 `- name: …` 块，含注释行随块删除）。
+/// `kept` 是要保留的站点名集合。
+fn remove_site_entries(content: &str, kept: &std::collections::HashSet<&str>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("- name:") {
+            let name = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            if !kept.contains(name) {
+                skipping = true;
+                continue;
+            }
+            skipping = false;
+            out.push(line.to_string());
+            continue;
+        }
+        if skipping {
+            // 条目内：缩进 > 0 的行、紧邻的空行都跳过；回到顶层（缩进 0）即停
+            if line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+                continue;
+            }
+            skipping = false;
+        }
+        out.push(line.to_string());
+    }
+    // 去掉尾部多余空行
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out.join("\n") + "\n"
+}
+
+/// 确保两级嵌套块 `parent:` → `  child:` 存在（存在则原样返回）。
+fn ensure_nested_section(content: &str, parent: &str, child: &str) -> String {
+    // 已有 parent 块？
+    let has_parent = content.lines().any(|l| {
+        let t = l.trim_start();
+        t == format!("{parent}:") || t.starts_with(&format!("{parent}: "))
+    });
+    if !has_parent {
+        let mut out = content.trim_end().to_string();
+        out.push_str(&format!("\n\n{parent}:\n  {child}:\n"));
+        return out;
+    }
+    // parent 块内已有 child？
+    let parent_prefix = format!("{parent}:");
+    let mut in_parent = false;
+    for line in content.lines() {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        if indent == 0 {
+            in_parent = t == parent_prefix || t.starts_with(&format!("{parent}: "));
+            continue;
+        }
+        if in_parent && (t == format!("{child}:") || t.starts_with(&format!("{child}: "))) {
+            return content.to_string();
+        }
+    }
+    // 有 parent 无 child：在 parent 行后插入 child 行
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    if let Some(idx) = lines
+        .iter()
+        .position(|l| l.trim_start() == parent_prefix || l.trim_start().starts_with(&format!("{parent}: ")))
+    {
+        lines.insert(idx + 1, format!("  {child}:"));
+    }
+    lines.join("\n") + "\n"
+}
+
+/// 嵌套块内字段就地更新（`parent:` → `  child:` → `    field: value`）。
+fn upsert_nested_field(content: &str, parent: &str, child: &str, field: &str, value: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let parent_prefix = format!("{parent}:");
+    let child_prefix = format!("{child}:");
+    let field_prefix = format!("{field}:");
+
+    // 1. 定位 parent（缩进 0）
+    let Some(p_idx) = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t == parent_prefix || t.starts_with(&format!("{parent}: "))
+    }) else {
+        return content.to_string();
+    };
+    // 2. 定位 child（parent 块内，缩进 > 0 且 < 下一顶层键）
+    let mut c_idx = None;
+    let mut insert_after = lines.len();
+    for (i, line) in lines.iter().enumerate().skip(p_idx + 1) {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        if indent == 0 && !t.is_empty() && !t.starts_with('#') {
+            insert_after = i;
+            break;
+        }
+        if indent > 0
+            && (t == child_prefix || t.starts_with(&format!("{child}: ")))
+        {
+            c_idx = Some(i);
+            break;
+        }
+    }
+    let Some(c_start) = c_idx else {
+        return content.to_string(); // ensure_nested_section 应已建好
+    };
+    // 3. child 块内找 field（缩进 > child 的缩进）
+    let child_indent = lines[c_start].len() - lines[c_start].trim_start().len();
+    let mut end = insert_after;
+    for (i, line) in lines.iter().enumerate().skip(c_start + 1) {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        if !t.is_empty() && !t.starts_with('#') && indent <= child_indent {
+            end = i;
+            break;
+        }
+    }
+    for (_i, line) in lines.iter_mut().enumerate().take(end).skip(c_start + 1) {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        if indent > child_indent && t.starts_with(&field_prefix) {
+            let rest = &t[field_prefix.len()..];
+            if rest.is_empty() || rest.starts_with(' ') {
+                *line = format!("{}{field}: {value}", " ".repeat(child_indent + 2));
+                return lines.join("\n") + "\n";
+            }
+        }
+    }
+    // 4. 补行到 child 块内最后
+    let mut last = c_start;
+    for (i, line) in lines.iter().enumerate().take(end).skip(c_start + 1) {
+        if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+            last = i;
+        }
+    }
+    lines.insert(last + 1, format!("{}{field}: {value}", " ".repeat(child_indent + 2)));
+    lines.join("\n") + "\n"
 }
 
 /// YAML 产物有效性验证：解析失败则拒写。
@@ -199,6 +335,33 @@ pub struct DownloaderForm {
     pub username: String,
     pub password: String,
     pub torrent_dir: String,
+    /// 行为开关（缺省 true / true / SeedHound，空串表示不改）
+    pub tag: String,
+    pub skip_hash_check: Option<bool>,
+    pub auto_start: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FeishuForm {
+    pub webhook_url: String,
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CookieCloudForm {
+    pub enabled: bool,
+    pub url: String,
+    pub uuid: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct JackettForm {
+    pub enabled: bool,
+    pub url: String,
+    pub api_key: String,
+    pub concurrency: String,
+    pub timeout: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -253,15 +416,26 @@ impl ConfigStore {
         next = upsert_section_field(&next, "downloader", "host", &form.host);
         next = upsert_section_field(&next, "downloader", "port", &form.port);
         next = upsert_section_field(&next, "downloader", "username", &form.username);
-        next = upsert_section_field(&next, "downloader", "port", &form.port);
         next = upsert_section_field(&next, "downloader", "password", &form.password);
         next = upsert_section_field(&next, "downloader", "torrent_dir", &form.torrent_dir);
+        if !form.tag.trim().is_empty() {
+            next = upsert_section_field(&next, "downloader", "tag", form.tag.trim());
+        }
+        if let Some(skip) = form.skip_hash_check {
+            let v = if skip { "true" } else { "false" };
+            next = upsert_section_field(&next, "downloader", "skip_hash_check", v);
+        }
+        if let Some(auto) = form.auto_start {
+            let v = if auto { "true" } else { "false" };
+            next = upsert_section_field(&next, "downloader", "auto_start", v);
+        }
         ensure_valid_yaml(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
     }
 
     /// 保存站点表单集合 → sites.yaml（逐字段行级写回）。
+    /// GUI 列表中已被删除的站点（yaml 有而表单无）一并从 yaml 移除。
     pub fn save_sites(&self, sites: &[SiteForm]) -> anyhow::Result<()> {
         let content = self.read_sites_text()?;
         let mut next = content.clone();
@@ -286,6 +460,10 @@ impl ConfigStore {
                 next = upsert_site_field(&next, &site.name, "api_url", &site.api_url);
             }
         }
+        // 移除 GUI 列表中已删除的条目
+        let kept: std::collections::HashSet<&str> =
+            sites.iter().filter(|s| !s.name.is_empty()).map(|s| s.name.as_str()).collect();
+        next = remove_site_entries(&next, &kept);
         ensure_valid_yaml(&next)?;
         std::fs::write(&self.sites_path, next)?;
         Ok(())
@@ -308,6 +486,65 @@ impl ConfigStore {
         let mut next = upsert_section_field(&content, "global", "concurrency", &concurrency.to_string());
         next = upsert_section_field(&next, "global", "batch_size", &batch_size.to_string());
         next = upsert_section_field(&next, "global", "mode", mode);
+        ensure_valid_yaml(&next)?;
+        std::fs::write(&self.config_path, next)?;
+        Ok(())
+    }
+
+    /// 保存飞书通知 → config.yaml（notify.feishu 块）。
+    pub fn save_feishu(&self, form: &FeishuForm) -> anyhow::Result<()> {
+        // notify.feishu 是嵌套块：先确保 notify: 与 feishu: 存在，再写子字段。
+        // 简化路径：用 upsert_section_field 处理不了两级嵌套，这里做定向嵌套写。
+        let content = self.read_config_text()?;
+        let mut next = ensure_nested_section(&content, "notify", "feishu");
+        let field = |next: String, k: &str, v: &str| -> String {
+            upsert_nested_field(&next, "notify", "feishu", k, v)
+        };
+        next = field(next, "webhook_url", &form.webhook_url);
+        next = field(next, "secret", &form.secret);
+        ensure_valid_yaml(&next)?;
+        std::fs::write(&self.config_path, next)?;
+        Ok(())
+    }
+
+    /// 保存 CookieCloud → config.yaml。
+    pub fn save_cookiecloud(&self, form: &CookieCloudForm) -> anyhow::Result<()> {
+        let content = self.read_config_text()?;
+        let mut next = content.clone();
+        let flag = if form.enabled { "true" } else { "false" };
+        next = upsert_section_field(&next, "cookiecloud", "enabled", flag);
+        next = upsert_section_field(&next, "cookiecloud", "url", &form.url);
+        next = upsert_section_field(&next, "cookiecloud", "uuid", &form.uuid);
+        next = upsert_section_field(&next, "cookiecloud", "password", &form.password);
+        ensure_valid_yaml(&next)?;
+        std::fs::write(&self.config_path, next)?;
+        Ok(())
+    }
+
+    /// 保存 Jackett → config.yaml。
+    pub fn save_jackett(&self, form: &JackettForm) -> anyhow::Result<()> {
+        let content = self.read_config_text()?;
+        let mut next = content.clone();
+        let flag = if form.enabled { "true" } else { "false" };
+        next = upsert_section_field(&next, "jackett", "enabled", flag);
+        next = upsert_section_field(&next, "jackett", "url", &form.url);
+        next = upsert_section_field(&next, "jackett", "api_key", &form.api_key);
+        if !form.concurrency.trim().is_empty() {
+            next = upsert_section_field(&next, "jackett", "concurrency", form.concurrency.trim());
+        }
+        if !form.timeout.trim().is_empty() {
+            next = upsert_section_field(&next, "jackett", "timeout", form.timeout.trim());
+        }
+        ensure_valid_yaml(&next)?;
+        std::fs::write(&self.config_path, next)?;
+        Ok(())
+    }
+
+    /// 保存日志设置 → config.yaml（log.level / log.file）。
+    pub fn save_log(&self, level: &str, file: &str) -> anyhow::Result<()> {
+        let content = self.read_config_text()?;
+        let mut next = upsert_section_field(&content, "log", "level", level);
+        next = upsert_section_field(&next, "log", "file", file);
         ensure_valid_yaml(&next)?;
         std::fs::write(&self.config_path, next)?;
         Ok(())
@@ -345,6 +582,12 @@ impl ConfigStore {
                 .unwrap_or("")
                 .to_string()
         };
+        let flag = |k: &str| -> Option<bool> {
+            parsed
+                .get("downloader")
+                .and_then(|d| d.get(k))
+                .and_then(|v| v.as_bool())
+        };
         Ok(DownloaderForm {
             dl_type: get("type"),
             host: get("host"),
@@ -352,7 +595,98 @@ impl ConfigStore {
             username: get("username"),
             password: get("password"),
             torrent_dir: get("torrent_dir"),
+            tag: get("tag"),
+            skip_hash_check: flag("skip_hash_check"),
+            auto_start: flag("auto_start"),
         })
+    }
+
+    /// 解析 notify.feishu 块。
+    pub fn load_feishu_form(&self) -> anyhow::Result<FeishuForm> {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&self.read_config_text()?)?;
+        let block = parsed.get("notify").and_then(|n| n.get("feishu"));
+        let get = |k: &str| -> String {
+            block
+                .and_then(|b| b.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        Ok(FeishuForm {
+            webhook_url: get("webhook_url"),
+            secret: get("secret"),
+        })
+    }
+
+    /// 解析 cookiecloud 块。
+    pub fn load_cookiecloud_form(&self) -> anyhow::Result<CookieCloudForm> {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&self.read_config_text()?)?;
+        let block = parsed.get("cookiecloud");
+        let enabled = block
+            .and_then(|b| b.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let get = |k: &str| -> String {
+            block
+                .and_then(|b| b.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        Ok(CookieCloudForm {
+            enabled,
+            url: get("url"),
+            uuid: get("uuid"),
+            password: get("password"),
+        })
+    }
+
+    /// 解析 jackett 块。
+    pub fn load_jackett_form(&self) -> anyhow::Result<JackettForm> {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&self.read_config_text()?)?;
+        let block = parsed.get("jackett");
+        let enabled = block
+            .and_then(|b| b.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let get_str = |k: &str| -> String {
+            block
+                .and_then(|b| b.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_num = |k: &str, d: &str| -> String {
+            block
+                .and_then(|b| b.get(k))
+                .and_then(|v| {
+                    v.as_i64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_f64().map(|f| f.to_string()))
+                })
+                .unwrap_or_else(|| d.to_string())
+        };
+        Ok(JackettForm {
+            enabled,
+            url: get_str("url"),
+            api_key: get_str("api_key"),
+            concurrency: get_num("concurrency", "5"),
+            timeout: get_num("timeout", "30"),
+        })
+    }
+
+    /// 解析 log 块。
+    pub fn load_log_form(&self) -> anyhow::Result<(String, String)> {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&self.read_config_text()?)?;
+        let block = parsed.get("log");
+        let get = |k: &str, d: &str| -> String {
+            block
+                .and_then(|b| b.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or(d)
+                .to_string()
+        };
+        Ok((get("level", "INFO"), get("file", "logs/reseed.log")))
     }
 }
 
@@ -429,5 +763,60 @@ sites:
     fn upsert_top_key_appends_when_missing() {
         let next = upsert_top_key("global:\n  mode: pieces_hash\n", "db", "path: data/x.db");
         assert!(next.contains("db: path: data/x.db"));
+    }
+
+    #[test]
+    fn nested_field_creates_and_updates() {
+        // 无 notify 块：创建
+        let created = ensure_nested_section("global:\n  mode: pieces_hash\n", "notify", "feishu");
+        assert!(created.contains("notify:"));
+        assert!(created.contains("feishu:"));
+        // 写字段
+        let with_field = upsert_nested_field(&created, "notify", "feishu", "webhook_url", "https://open.feishu.cn/hook/x");
+        let v: serde_yaml::Value = serde_yaml::from_str(&with_field).unwrap();
+        assert_eq!(
+            v.get("notify").unwrap().get("feishu").unwrap().get("webhook_url").unwrap().as_str(),
+            Some("https://open.feishu.cn/hook/x")
+        );
+        // 就地更新
+        let updated = upsert_nested_field(&with_field, "notify", "feishu", "webhook_url", "https://other");
+        assert!(updated.contains("https://other"));
+        assert!(!updated.contains("hook/x"));
+    }
+
+    #[test]
+    fn nested_field_preserves_sibling_sections() {
+        let cfg = "global:\n  mode: pieces_hash\n\nnotify:\n  feishu:\n    webhook_url: old\n\njackett:\n  enabled: false\n";
+        let next = upsert_nested_field(cfg, "notify", "feishu", "webhook_url", "new");
+        let v: serde_yaml::Value = serde_yaml::from_str(&next).unwrap();
+        assert_eq!(v.get("jackett").unwrap().get("enabled").unwrap().as_bool(), Some(false));
+        assert_eq!(
+            v.get("notify").unwrap().get("feishu").unwrap().get("webhook_url").unwrap().as_str(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn remove_site_entries_drops_unkept() {
+        let mut kept = std::collections::HashSet::new();
+        kept.insert("siteA");
+        let next = remove_site_entries(SAMPLE_SITES, &kept);
+        assert!(next.contains("siteA"));
+        assert!(!next.contains("siteB"));
+        assert!(next.contains("# 站点"));
+        let v: serde_yaml::Value = serde_yaml::from_str(&next).unwrap();
+        let sites = v.get("sites").unwrap().as_sequence().unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].get("name").unwrap().as_str(), Some("siteA"));
+    }
+
+    #[test]
+    fn remove_site_entries_all_kept_noop() {
+        let mut kept = std::collections::HashSet::new();
+        kept.insert("siteA");
+        kept.insert("siteB");
+        let next = remove_site_entries(SAMPLE_SITES, &kept);
+        assert!(next.contains("siteA"));
+        assert!(next.contains("siteB"));
     }
 }

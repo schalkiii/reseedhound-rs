@@ -109,6 +109,9 @@ impl SetupWizard {
             username: self.dl_user.read(cx).value(),
             password: self.dl_pass.read(cx).value(),
             torrent_dir: self.dl_dir.read(cx).value(),
+            tag: String::new(),
+            skip_hash_check: None,
+            auto_start: None,
         };
         if let Err(e) = self.store.save_downloader(&form) {
             self.error = Some(format!("下载器配置保存失败: {e}"));
