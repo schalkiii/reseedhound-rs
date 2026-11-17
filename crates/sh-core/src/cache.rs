@@ -49,6 +49,18 @@ impl TorrentCache {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_pieces_hash ON pieces_cache(pieces_hash);
+            CREATE TABLE IF NOT EXISTS file_cache (
+                path TEXT PRIMARY KEY,
+                mtime INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                info_hash TEXT NOT NULL,
+                pieces_hash TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                torrent_name TEXT,
+                total_size INTEGER,
+                announce TEXT,
+                announce_list TEXT
+            );
             CREATE TABLE IF NOT EXISTS dead_torrents (
                 site_name TEXT NOT NULL,
                 torrent_id INTEGER NOT NULL,
@@ -120,6 +132,137 @@ impl TorrentCache {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// 批量查询文件级解析缓存（path + mtime + size 完全一致才算命中）。
+    ///
+    /// 命中可跳过整个「读文件 + bencode 解析 + 算 pieces_hash」流程——
+    /// pieces_cache 只按 pieces_hash 记账，无法替代这一步。
+    pub fn lookup_file_cache(
+        &self,
+        keys: &[(String, i64, i64)],
+    ) -> anyhow::Result<std::collections::HashMap<String, crate::parser::TorrentInfo>> {
+        use crate::parser::TorrentInfo;
+        let conn = self.conn.lock().unwrap();
+        let mut out = std::collections::HashMap::new();
+        for batch in keys.chunks(900) {
+            let identity: std::collections::HashMap<&str, (i64, i64)> = batch
+                .iter()
+                .map(|(p, m, s)| (p.as_str(), (*m, *s)))
+                .collect();
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let sql = format!(
+                "SELECT path, mtime, size, info_hash, pieces_hash, file_name, \
+                        torrent_name, total_size, announce, announce_list \
+                 FROM file_cache WHERE path IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(batch.iter().map(|k| k.0.clone())),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (path, mtime, size, info_hash, pieces_hash, file_name, torrent_name,
+                    total_size, announce, announce_list) = row?;
+                // 文件身份校验：mtime/size 任一不符即视为未命中（文件被替换过）
+                if identity.get(path.as_str()) != Some(&(mtime, size)) {
+                    continue;
+                }
+                let announce_list = announce_list.and_then(|s| {
+                    serde_json::from_str::<Vec<String>>(&s).ok()
+                });
+                out.insert(
+                    path,
+                    TorrentInfo {
+                        info_hash,
+                        pieces_hash,
+                        file_name,
+                        file_path: String::new(),
+                        torrent_name,
+                        total_size,
+                        announce,
+                        announce_list,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// 写入/更新文件级解析缓存（INSERT OR REPLACE）。
+    pub fn store_file_cache(
+        &self,
+        entries: &[(String, i64, i64, crate::parser::TorrentInfo)],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO file_cache \
+                 (path, mtime, size, info_hash, pieces_hash, file_name, \
+                  torrent_name, total_size, announce, announce_list) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
+            )?;
+            for (path, mtime, size, info) in entries {
+                let announce_list = info
+                    .announce_list
+                    .as_ref()
+                    .map(|l| serde_json::to_string(l).unwrap_or_default());
+                stmt.execute(rusqlite::params![
+                    path,
+                    mtime,
+                    size,
+                    info.info_hash,
+                    info.pieces_hash,
+                    info.file_name,
+                    info.torrent_name,
+                    info.total_size,
+                    info.announce,
+                    announce_list
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 裁剪 keep 集合之外的陈旧行（对应文件已从 BT_backup 删除）。
+    pub fn prune_file_cache(
+        &self,
+        keep: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut stale: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT path FROM file_cache")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let path = row?;
+                if !keep.contains(&path) {
+                    stale.push(path);
+                }
+            }
+        }
+        let mut deleted = 0usize;
+        for batch in stale.chunks(900) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let sql = format!("DELETE FROM file_cache WHERE path IN ({placeholders})");
+            deleted += conn.execute(&sql, rusqlite::params_from_iter(batch.iter()))?;
+        }
+        Ok(deleted)
     }
 
     pub fn add_reseed_record(

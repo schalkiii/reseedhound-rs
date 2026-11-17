@@ -52,3 +52,12 @@
 - Python：`py -3.13 -m pytest tests/` **192 全过**。
 - 站点解封后再做真实验证；**麒麟只做少量验证**（单站点范围、小批量），避免再次触发小时下载上限。
 - 遗留共同议题（需要时再做）：每站每轮下载上限配置；下载去重缓存（site torrent_id → info_hash）。
+
+## 6. 文件级解析缓存（2026-11-18 双侧同步实现）
+
+- Rust：`cache.rs` file_cache 表 + lookup/store/prune；`parser.rs::scan_directory_with_cache`
+  并行 stat + 增量解析；`seeder` 接线（日志「文件级解析缓存: 命中 X, 解析 Y」）。
+- Python：`storage/cache.py` / `engine/parser.py` 同口径（`scan_directory(..., cache=)`），测试替身补齐接口。
+- 测试：Rust `scan_directory_with_cache_skips_unchanged_files`（首轮解析/二轮命中/改文件增量/删除裁剪）；
+  Python `test_scan_directory_file_cache_skips_unchanged_files` 同断言。Rust 126 / Python 193 全过。
+- 实测见 docs/PERF §6（热路径 50.9s → 1.5s）。

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use sh_core::cache::TorrentCache;
 use sh_core::config::{Config, DownloaderRole};
-use sh_core::parser::{parse_bytes, scan_directory, TorrentInfo};
+use sh_core::parser::{parse_bytes, scan_directory_with_cache, TorrentInfo};
 use sh_core::stats::ReseedStats;
 
 use crate::downloader::{DownloaderClient, DownloaderConn, DownloaderKind};
@@ -370,8 +370,15 @@ impl ReseedEngine {
         if torrent_dir.is_empty() {
             anyhow::bail!("downloader.torrent_dir 未配置：请在 config.yaml 中填写种子文件目录");
         }
-        let torrents = scan_directory(&torrent_dir)?;
+        // 文件级解析缓存：(path,mtime,size) 命中则跳过读盘解析
+        let scan = scan_directory_with_cache(&torrent_dir, &self.cache)?;
+        let torrents = scan.torrents;
         stats.total_torrents = torrents.len() as u64;
+        tracing::info!(
+            "[阶段1] 文件级解析缓存: 命中 {}（跳过解析）, 解析 {}",
+            scan.cache_hits,
+            scan.parsed
+        );
 
         // 缓存增量
         let pieces: Vec<String> = torrents.iter().map(|t| t.pieces_hash.clone()).collect();
