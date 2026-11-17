@@ -32,10 +32,10 @@ GUI 覆盖 CLI 全部功能：仪表盘可触发立即辅种 / 同步 Cookie / �
 - `crates/sh-engine`：site_client/downloader/hdarea/jackett/cookiecloud/savept/feishu/seeder/scheduler/weekly_report
 - `crates/sh-app`：main（编排）/setup_wizard（首启向导）/settings（配置编辑）/dashboard/text_input/theme/tray
 - 命名与结构遵循：描述性命名、集中参数管理、精确类型、拒绝冗余（对齐用户 RTL 代码规范）
-- 文档在 `docs/`：RUST-PLAN（里程碑）、AUDIT（三轮审计）、BENCHMARK、GUI-FIX、PYTHON-INDEX
+- 文档在 `docs/`：RUST-PLAN（里程碑，已收口）、AUDIT（审计记录）、BENCHMARK、GUI-FIX、PYTHON-INDEX；根 README.md 面向用户
 
 ## 当前状态与下一步
 
-- 全部功能移植完成（三轮审计：轮二修 6 项缺陷、轮三补文件日志/weekly-report/SEEDHOUND_MODE/reseed 自动升级；GUI 轮：修 Tab 切换/布局/退出残留，补齐 CLI 功能 GUI 覆盖；审美轮：全 GUI 去模板味重做——石墨色板/下划线 Tab/滑块开关/无框卡片/等宽数据条，清理死代码 BORDER/LINK/SURFACE_HOVER/Dashboard 冗余字段），76/76 测试，clippy 0 警告
-- 已知遗留（见 AUDIT「遗留建议」）：站内批次并发 2+熔断、连接池上限调优、qB 5.x 真机验证、GUI 调度开关变更需重启生效
-- git：v0.1.0 已打 tag（提交身份 schalkiii@github.com）
+- 全部功能移植完成（三轮审计：轮二修 6 项缺陷、轮三补文件日志/weekly-report/SEEDHOUND_MODE/reseed 自动升级；GUI 轮：修 Tab 切换/布局/退出残留，补齐 CLI 功能 GUI 覆盖；审美轮：全 GUI 去模板味重做——石墨色板/下划线 Tab/滑块开关/无框卡片/等宽数据条；审计四轮（AUDIT-REPORT-2026-11-17）：credential_failures 回填/ --site missing 告警 / qb_info_hashes 增量去重 / save_path 传递 / README 补齐），76/76 测试，clippy 0 警告
+- 已知遗留（见 AUDIT-REPORT-2026-11-17 P3 与 AUDIT-2026-11-16 遗留建议）：站内批次并发 2+熔断、连接池上限调优、qB 5.x 真机验证、GUI 调度开关变更需重启生效
+- git：v0.1.0 已打 tag（提交身份 schalkiii@github.com）；v0.2.0 含第四轮修复（凭据警报/增量去重/save_path）
