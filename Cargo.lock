@@ -5531,7 +5531,7 @@ dependencies = [
 
 [[package]]
 name = "sh-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gpui",
@@ -5548,7 +5548,7 @@ dependencies = [
 
 [[package]]
 name = "sh-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5561,7 +5561,7 @@ dependencies = [
 
 [[package]]
 name = "sh-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5579,7 +5579,7 @@ dependencies = [
 
 [[package]]
 name = "sh-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "anyhow",

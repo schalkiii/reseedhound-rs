@@ -251,16 +251,33 @@ impl ReseedScheduler {
         report
     }
 
+    /// 从磁盘重读 config.yaml（GUI 保存即写盘，调度参数实时生效）。
+    /// 读取失败时沿用现有配置并告警。
+    fn reload_config(&self) -> Arc<Config> {
+        let sites_path = self.config.sites_path.to_string_lossy().to_string();
+        match Config::load(&self.config_path, &sites_path) {
+            Ok(fresh) => Arc::new(fresh),
+            Err(e) => {
+                tracing::warn!("config 重读失败(沿用旧配置): {e}");
+                self.config.clone()
+            }
+        }
+    }
+
     /// 调度主循环：定时轮次 + 手动触发 + 退出信号三路 select。
+    ///
+    /// 调度开关与间隔每轮（及等待期间每 CONFIG_TICK）从磁盘重读，
+    /// GUI 修改保存后无需重启程序即可生效。
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let interval = Duration::from_secs_f64(self.config.scheduler_interval_seconds());
+        const CONFIG_TICK: Duration = Duration::from_secs(5);
         let startup_delay = Duration::from_secs_f64(self.config.scheduler_startup_delay());
         let run_on_start = self.config.scheduler_run_on_start();
 
         let mut cycle: u64 = 0;
+        let mut first = true;
         tracing::info!(
             "调度器启动: 间隔 {:.0?}{}",
-            interval,
+            Duration::from_secs_f64(self.config.scheduler_interval_seconds()),
             if run_on_start {
                 ", 立即执行首轮"
             } else {
@@ -280,31 +297,54 @@ impl ReseedScheduler {
         }
 
         loop {
-            if run_on_start || cycle > 0 {
+            // 每轮重读配置（本轮引擎与 CookieCloud 同步使用最新值）
+            self.config = self.reload_config();
+            let mut enabled = self.config.scheduler_enabled();
+            let mut interval = self.config.scheduler_interval_seconds();
+
+            if enabled && (run_on_start || !first) {
                 cycle += 1;
                 self.execute_cycle(cycle).await;
-            } else {
-                cycle += 1;
             }
+            first = false;
 
-            // 等待间隔 / 手动触发 / 退出信号
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = self.stop.changed() => {
-                    tracing::info!("收到退出信号，调度器停止");
-                    return Ok(());
-                }
-                received = async {
-                    match self.trigger.as_mut() {
-                        Some(rx) => rx.recv().await.is_some(),
-                        None => std::future::pending().await,
+            // 等待间隔 / 手动触发 / 退出信号；每 CONFIG_TICK 重读调度配置
+            let mut elapsed = 0f64;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(CONFIG_TICK) => {
+                        elapsed += CONFIG_TICK.as_secs_f64();
+                        self.config = self.reload_config();
+                        let new_enabled = self.config.scheduler_enabled();
+                        let new_interval = self.config.scheduler_interval_seconds();
+                        if new_enabled != enabled || new_interval != interval {
+                            tracing::info!(
+                                "调度配置已变更: enabled={new_enabled}, interval={new_interval:.0}s（实时生效）"
+                            );
+                            enabled = new_enabled;
+                            interval = new_interval;
+                            elapsed = 0.0;
+                        }
+                        if enabled && elapsed >= interval {
+                            break;
+                        }
                     }
-                } => {
-                    if received {
-                        cycle += 1;
-                        tracing::info!("===== 手动触发 第 {cycle} 轮辅种 =====");
-                        self.execute_cycle(cycle).await;
-                    } else {
+                    _ = self.stop.changed() => {
+                        tracing::info!("收到退出信号，调度器停止");
+                        return Ok(());
+                    }
+                    received = async {
+                        match self.trigger.as_mut() {
+                            Some(rx) => rx.recv().await.is_some(),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if received {
+                            cycle += 1;
+                            tracing::info!("===== 手动触发 第 {cycle} 轮辅种 =====");
+                            self.execute_cycle(cycle).await;
+                            elapsed = 0.0;
+                        }
                         // 触发通道关闭（发送端全部 drop）→ 忽略，继续定时轮次
                     }
                 }

@@ -407,32 +407,10 @@ fn spawn_scheduler(
                 }));
             }
 
-            if scheduler.scheduler_enabled() {
-                if let Err(e) = scheduler.run().await {
-                    tracing::error!("调度器异常: {e}");
-                }
-            } else {
-                tracing::info!("定时调度未启用，常驻等待（托盘可手动触发）");
-                let mut stop_rx_inner = stop_tx.subscribe();
-                let mut trigger = scheduler.take_trigger();
-                loop {
-                    tokio::select! {
-                        _ = stop_rx_inner.changed() => break,
-                        received = async {
-                            match trigger.as_mut() {
-                                Some(t) => t.recv().await,
-                                None => std::future::pending().await,
-                            }
-                        } => {
-                            if received.is_none() { break; }
-                            let report = scheduler.run_cycle(1).await;
-                            if let Some(err) = &report.error {
-                                tracing::error!("{err}");
-                            }
-                            scheduler.report_to(&report);
-                        }
-                    }
-                }
+            // 调度开关/间隔由 run() 内部每轮（及等待期间每 5s）从磁盘重读，
+            // GUI 修改保存后实时生效，无需重启程序
+            if let Err(e) = scheduler.run().await {
+                tracing::error!("调度器异常: {e}");
             }
         });
     })

@@ -24,6 +24,7 @@ pub struct FeishuNotifier {
 impl FeishuNotifier {
     pub fn new(webhook_url: &str, secret: Option<&str>) -> Self {
         let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(4)
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("reqwest client");

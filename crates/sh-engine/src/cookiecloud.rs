@@ -54,6 +54,7 @@ impl CookieCloudClient {
             digest[..16].try_into().expect("md5 digest is 16 bytes")
         };
         let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(4)
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("ReseedHound-RS/0.1")
             .build()?;

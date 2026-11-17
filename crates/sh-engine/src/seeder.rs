@@ -543,37 +543,115 @@ impl ReseedEngine {
                         (site, results, site_dl_urls)
                     } else {
                         tracing::info!("查询站点: {} ({} 个种子)", site.name, site_hashes.len());
-                        let mut results = Vec::new();
-                        for batch in site_hashes.chunks(batch_size.max(1)) {
-                            let body = serde_json::json!({
-                                "passkey": site.passkey,
-                                "pieces_hash": batch,
-                            });
-                            let Some(api_url) = site.api_url.clone() else {
-                                continue;
-                            };
-                            let resp = client
-                                .post_json(&api_url, &body, None, retry_count.max(1), "")
-                                .await;
-                            if let Some(v) = resp {
-                                if let Some(data) = v.get("data").and_then(|d| d.as_object()) {
-                                    for (ph, tid) in data {
-                                        if ph == "passkey" || ph == "pieces_hash" {
-                                            continue;
-                                        }
-                                        let id = match tid {
-                                            serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
-                                            serde_json::Value::String(sv) => {
-                                                sv.parse::<i64>().unwrap_or(0)
+                        // 站内批次并发（对齐 Python query_site_batched）：
+                        // 并发 2 + 连续失败 5 次熔断跳过剩余批次 + 批次统计日志
+                        const SITE_BATCH_CONCURRENCY: usize = 2;
+                        const MAX_CONSECUTIVE_FAILURES: usize = 5;
+                        let batch_sem = Arc::new(Semaphore::new(SITE_BATCH_CONCURRENCY));
+                        let site_dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let consecutive_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let batch_ok = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let batch_fail = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+                        let batches: Vec<Vec<String>> = site_hashes
+                            .chunks(batch_size.max(1))
+                            .map(|c| c.to_vec())
+                            .collect();
+                        let total_batches = batches.len();
+                        let mut batch_handles = Vec::new();
+                        for batch in batches.into_iter() {
+                            let site = site.clone();
+                            let client = client.clone();
+                            let batch_sem = batch_sem.clone();
+                            let site_dead = site_dead.clone();
+                            let consecutive_failures = consecutive_failures.clone();
+                            let batch_ok = batch_ok.clone();
+                            let batch_fail = batch_fail.clone();
+                            let results = results.clone();
+                            let retry_count = retry_count.max(1);
+                            batch_handles.push(tokio::spawn(async move {
+                                if site_dead.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
+                                let _permit = match batch_sem.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => return,
+                                };
+                                if site_dead.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
+                                let body = serde_json::json!({
+                                    "passkey": site.passkey,
+                                    "pieces_hash": batch,
+                                });
+                                let Some(api_url) = site.api_url.clone() else {
+                                    return;
+                                };
+                                let resp = client
+                                    .post_json(&api_url, &body, None, retry_count, "")
+                                    .await;
+                                match resp {
+                                    Some(v) => {
+                                        batch_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        consecutive_failures
+                                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                                        if let Some(data) = v.get("data").and_then(|d| d.as_object())
+                                        {
+                                            let mut guard = results.lock().await;
+                                            for (ph, tid) in data {
+                                                if ph == "passkey" || ph == "pieces_hash" {
+                                                    continue;
+                                                }
+                                                let id = match tid {
+                                                    serde_json::Value::Number(n) => {
+                                                        n.as_i64().unwrap_or(0)
+                                                    }
+                                                    serde_json::Value::String(sv) => {
+                                                        sv.parse::<i64>().unwrap_or(0)
+                                                    }
+                                                    _ => 0,
+                                                };
+                                                if id > 0 {
+                                                    guard.push((ph.clone(), id));
+                                                }
                                             }
-                                            _ => 0,
-                                        };
-                                        if id > 0 {
-                                            results.push((ph.clone(), id));
+                                        }
+                                    }
+                                    None => {
+                                        let fails = batch_fail
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                        let consecutive = consecutive_failures
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                        if consecutive >= MAX_CONSECUTIVE_FAILURES
+                                            && !site_dead
+                                                .swap(true, std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            tracing::warn!(
+                                                "站点 {} 连续 {} 次失败 (共 {}/{} 批次失败)，跳过剩余批次",
+                                                site.name,
+                                                consecutive,
+                                                fails,
+                                                total_batches
+                                            );
                                         }
                                     }
                                 }
-                            }
+                            }));
+                        }
+                        for h in batch_handles {
+                            let _ = h.await;
+                        }
+                        let results = results.lock().await.clone();
+                        if batch_fail.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                            tracing::warn!(
+                                "站点 {} 批次查询: 成功 {}/{}",
+                                site.name,
+                                batch_ok.load(std::sync::atomic::Ordering::Relaxed),
+                                total_batches
+                            );
                         }
                         (site, results, Vec::new())
                     }

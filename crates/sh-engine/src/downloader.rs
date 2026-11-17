@@ -54,6 +54,7 @@ pub struct AddResult {
 impl DownloaderClient {
     pub fn new(conn: DownloaderConn) -> Self {
         let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(4)
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("reqwest client");

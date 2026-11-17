@@ -339,7 +339,7 @@ impl SettingsPage {
             Ok(()) => {
                 self.status = Some(if sched_changed {
                     (
-                        "已保存。注意：定时调度开关变更需重启程序后生效".into(),
+                        "已保存。调度开关与间隔变更实时生效".into(),
                         true,
                     )
                 } else {
@@ -464,6 +464,40 @@ impl Render for SettingsPage {
                                                                     r.form.enabled = !r.form.enabled;
                                                                 }
                                                                 cx.notify();
+                                                            })),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(("site-up", idx))
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .text_xs()
+                                                            .text_color(if idx == 0 { theme::TRANSPARENT } else { theme::TEXT_FAINT })
+                                                            .hover(|s| if idx == 0 { s } else { s.cursor_pointer().text_color(theme::TEXT).bg(theme::BTN_GHOST_HOVER) })
+                                                            .child("上移")
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                                                                if idx > 0 {
+                                                                    this.sites.swap(idx, idx - 1);
+                                                                    cx.notify();
+                                                                }
+                                                            })),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(("site-down", idx))
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .text_xs()
+                                                            .text_color(if idx + 1 >= self.sites.len() { theme::TRANSPARENT } else { theme::TEXT_FAINT })
+                                                            .hover(|s| if idx + 1 >= self.sites.len() { s } else { s.cursor_pointer().text_color(theme::TEXT).bg(theme::BTN_GHOST_HOVER) })
+                                                            .child("下移")
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
+                                                                if idx + 1 < this.sites.len() {
+                                                                    this.sites.swap(idx, idx + 1);
+                                                                    cx.notify();
+                                                                }
                                                             })),
                                                     )
                                                     .child(
