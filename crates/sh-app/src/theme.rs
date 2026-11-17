@@ -1,7 +1,9 @@
-//! 设计系统：统一配色 / 间距 / 圆角，深色主题（Task 审美升级）。
+//! 设计系统：中性石墨基底 + 单一哑光强调色（专业工具风，类 Zed/Linear）。
 //!
-//! 色板取自 Material Design 暗色基调 + 自定义品牌色（藏青-青蓝渐变系），
-//! 与托盘图标（深蓝底 + 亮蓝种子）视觉呼应。
+//! 原则：
+//! - 背景分层靠明度微差（BG < SURFACE < ELEVATED），不靠边框堆砌
+//! - 唯一品牌强调色（雾蓝），只用于主按钮与激活态；语义色仅状态灯使用
+//! - 文字层级：TEXT / TEXT_DIM / TEXT_FAINT 三档
 
 use gpui::Rgba;
 
@@ -15,64 +17,61 @@ const fn c(hex: u32) -> Rgba {
     }
 }
 
-// ---------- 品牌色 ----------
-
-/// 主品牌色：亮蓝紫（标题 / 顶栏 / 强调）
-pub const ACCENT: Rgba = c(0x7c9cf5);
-
-/// 顶栏底部渐变的亮端（预留渐变装饰用）
-#[allow(dead_code)]
-pub const ACCENT_BRIGHT: Rgba = c(0x4fc3f7);
+// ---------- 中性基底（石墨系） ----------
 
 /// 页面背景
-pub const BG: Rgba = c(0x10141f);
+pub const BG: Rgba = c(0x141518);
 
 /// 卡片 / 面板背景
-pub const SURFACE: Rgba = c(0x1a1f2e);
+pub const SURFACE: Rgba = c(0x1b1d21);
 
-/// 卡片 hover 背景
-pub const SURFACE_HOVER: Rgba = c(0x222838);
+/// 输入框背景（比面板更深一档，凹陷感）
+pub const INPUT_BG: Rgba = c(0x111316);
 
-/// 输入框背景
-pub const INPUT_BG: Rgba = c(0x0d1117);
+/// 分隔线（比边框更克制）
+pub const DIVIDER: Rgba = c(0x232629);
 
-/// 边框
-pub const BORDER: Rgba = c(0x2c3447);
+// ---------- 文字 ----------
 
 /// 主文本
-pub const TEXT: Rgba = c(0xe8eaf0);
+pub const TEXT: Rgba = c(0xdcdde1);
 
 /// 次要文本（标签 / 说明）
-pub const TEXT_DIM: Rgba = c(0x8b93a7);
+pub const TEXT_DIM: Rgba = c(0x8b8f98);
 
-// ---------- 语义色 ----------
+/// 弱文本（占位 / 脚注）
+pub const TEXT_FAINT: Rgba = c(0x5f636b);
 
-pub const GREEN: Rgba = c(0x4ade80);
-pub const RED: Rgba = c(0xf87171);
-pub const YELLOW: Rgba = c(0xfbbf24);
-pub const BLUE: Rgba = c(0x60a5fa);
+// ---------- 品牌强调（唯一彩色，哑光雾蓝） ----------
 
-/// 链接 / 交互强调
-pub const LINK: Rgba = c(0x93c5fd);
+pub const ACCENT: Rgba = c(0x6a9bd8);
+
+pub const BTN_PRIMARY: Rgba = c(0x3d6db3);
+
+pub const BTN_PRIMARY_HOVER: Rgba = c(0x4a7cc6);
+
+// ---------- 语义色（低饱和，仅状态） ----------
+
+pub const GREEN: Rgba = c(0x5da970);
+pub const RED: Rgba = c(0xc96a6a);
+pub const YELLOW: Rgba = c(0xbfa14e);
+pub const BLUE: Rgba = c(0x6a9bd8);
 
 // ---------- 派生 ----------
 
-/// 半透明遮罩（弹层背景，预留）
-#[allow(dead_code)]
-pub const OVERLAY: Rgba = Rgba { r: 0.05, g: 0.05, b: 0.09, a: 0.55 };
-
-/// 主要按钮背景（蓝紫渐变的中间值）
-pub const BTN_PRIMARY: Rgba = c(0x3b82f6);
-
-pub const BTN_PRIMARY_HOVER: Rgba = c(0x2563eb);
-
-/// 次要按钮（描边）
-pub const BTN_GHOST_HOVER: Rgba = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 0.125 };
+/// 次要按钮 hover
+pub const BTN_GHOST_HOVER: Rgba = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 0.08 };
 
 /// 禁用
-pub const DISABLED: Rgba = c(0x4b5563);
+pub const DISABLED: Rgba = c(0x3b3e44);
 
-// ---------- 状态灯四档（站点明细） ----------
+/// 主按钮上的文字
+pub const TEXT_ON_PRIMARY: Rgba = c(0xf2f5f9);
+
+/// 全透明（非激活 Tab 下划线占位，保持基线对齐）
+pub const TRANSPARENT: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+
+// ---------- 状态灯（站点明细，返回字符为空——用色点绘制） ----------
 
 pub fn status_dot(failed: u64, succeeded: u64, matched: u64) -> (&'static str, Rgba) {
     if failed > 0 {
@@ -82,17 +81,17 @@ pub fn status_dot(failed: u64, succeeded: u64, matched: u64) -> (&'static str, R
     } else if matched > 0 {
         ("●", YELLOW)
     } else {
-        ("○", TEXT_DIM)
+        ("○", TEXT_FAINT)
     }
 }
 
 /// 状态条文字与颜色（顶栏运行状态）。
 pub fn status_badge(running: bool, scheduler_on: bool) -> (&'static str, Rgba) {
     if running {
-        ("辅种运行中", BLUE)
+        ("运行中", BLUE)
     } else if scheduler_on {
         ("调度待机", GREEN)
     } else {
-        ("手动模式", TEXT_DIM)
+        ("手动", TEXT_DIM)
     }
 }

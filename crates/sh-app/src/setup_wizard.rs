@@ -161,7 +161,7 @@ impl Render for SetupWizard {
                     .child(
                         div()
                             .text_2xl()
-                            .text_color(theme::ACCENT)
+                            .text_color(theme::TEXT)
                             .child("欢迎使用 ReseedHound RS"),
                     )
                     .child(
@@ -176,16 +176,14 @@ impl Render for SetupWizard {
                     ),
             )
             .child(
-                // 表单卡片
+                // 表单卡片（无外框，靠明度分层）
                 div()
                     .flex()
                     .flex_col()
                     .gap_4()
                     .p_6()
-                    .rounded_xl()
+                    .rounded_lg()
                     .bg(theme::SURFACE)
-                    .border_1()
-                    .border_color(theme::BORDER)
                     .children(match step {
                         1 => vec![
                             Self::field_row("下载器类型（qbittorrent / transmission）", &self.dl_type, None),
@@ -210,10 +208,10 @@ impl Render for SetupWizard {
                 div()
                     .px_4().py_2()
                     .rounded_md()
-                    .bg(rgb(0x7f1d1d))
+                    .bg(rgb(0x3a2424))
                     .text_color(theme::RED)
                     .text_sm()
-                    .child(format!("⚠ {e}"))
+                    .child(e)
             }))
             .child(
                 // 底部按钮
@@ -225,15 +223,13 @@ impl Render for SetupWizard {
                         // 上一步（第 1 步时禁用视觉）
                         div()
                             .id("wiz-back")
-                            .px_5().py_2()
-                            .rounded_lg()
+                            .px_4().py_1p5()
+                            .rounded_md()
                             .text_sm()
                             .text_color(theme::TEXT_DIM)
-                            .border_1()
-                            .border_color(theme::BORDER)
                             .opacity(if step > 1 { 1.0 } else { 0.3 })
-                            .hover(|s| if step > 1 { s.cursor_pointer().bg(theme::BTN_GHOST_HOVER) } else { s })
-                            .child("← 上一步")
+                            .hover(|s| if step > 1 { s.cursor_pointer().bg(theme::BTN_GHOST_HOVER).text_color(theme::TEXT) } else { s })
+                            .child("上一步")
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _w, cx| {
                                 if this.step > 1 {
                                     this.step -= 1;
@@ -245,15 +241,14 @@ impl Render for SetupWizard {
                     .child(
                         div().flex().gap_3()
                             .child(if step == 2 {
-                                // 跳过站点
+                                // 跳过站点（ghost 文字按钮）
                                 div()
                                     .id("wiz-skip")
-                                    .px_5().py_2()
-                                    .rounded_lg()
+                                    .px_4().py_1p5()
+                                    .rounded_md()
                                     .text_sm()
                                     .text_color(theme::TEXT_DIM)
-                                    .border_1().border_color(theme::BORDER)
-                                    .hover(|s| s.cursor_pointer().bg(theme::BTN_GHOST_HOVER))
+                                    .hover(|s| s.cursor_pointer().bg(theme::BTN_GHOST_HOVER).text_color(theme::TEXT))
                                     .child("跳过站点，稍后配置")
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, w, cx| {
                                         this.site_name.update(cx, |i, _c| { i.content = "".into(); });
@@ -266,13 +261,13 @@ impl Render for SetupWizard {
                             .child(
                                 div()
                                     .id("wiz-next")
-                                    .px_6().py_2()
-                                    .rounded_lg()
+                                    .px_5().py_1p5()
+                                    .rounded_md()
                                     .bg(theme::BTN_PRIMARY)
-                                    .text_color(rgb(0xffffff))
+                                    .text_color(theme::TEXT_ON_PRIMARY)
                                     .text_sm()
                                     .hover(|s| s.cursor_pointer().bg(theme::BTN_PRIMARY_HOVER))
-                                    .child(if step == 1 { "下一步 →".to_string() } else { "完成配置 ✓".to_string() })
+                                    .child(if step == 1 { "下一步".to_string() } else { "完成配置".to_string() })
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, w, cx| {
                                         if this.step == 1 {
                                             this.step = 2;

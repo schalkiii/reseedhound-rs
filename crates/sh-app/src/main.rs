@@ -46,8 +46,6 @@ struct DashParts {
     actions: tokio::sync::mpsc::Sender<dashboard::GuiAction>,
     tray: std::sync::mpsc::Sender<TrayCommand>,
     store: Arc<ConfigStore>,
-    config_path: String,
-    sites_path: String,
 }
 
 impl RootView {
@@ -57,8 +55,6 @@ impl RootView {
             trigger: parts.trigger.clone(),
             actions: parts.actions.clone(),
             tray: parts.tray.clone(),
-            config_path: parts.config_path.clone(),
-            sites_path: parts.sites_path.clone(),
             page: dashboard::Page::Dashboard,
             settings: None,
             config_store: parts.store.clone(),
@@ -214,8 +210,6 @@ fn main() {
             actions: action_tx.clone(),
             tray: tray_tx.clone(),
             store: store.clone(),
-            config_path: config_path_str.clone(),
-            sites_path: sites_path_str.clone(),
         };
         let arm = arm_scheduler.clone();
 
@@ -240,8 +234,6 @@ fn main() {
                             trigger: parts.trigger.clone(),
                             actions: parts.actions.clone(),
                             tray: parts.tray.clone(),
-                            config_path: parts.config_path.clone(),
-                            sites_path: parts.sites_path.clone(),
                             page: dashboard::Page::Dashboard,
                             settings: None,
                             config_store: parts.store.clone(),

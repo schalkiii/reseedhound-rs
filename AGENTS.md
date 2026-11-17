@@ -17,7 +17,7 @@ cargo clippy --workspace       # 项目代码应保持 0 警告
 
 CLI 命令面：`reseed`（scheduler.enabled=true 时自动切定时）/ `schedule` / `sync-cookies` / `check-dead` / `weekly-report`（周报+日志清理）/ `gui`。无子命令时读 `SEEDHOUND_MODE` 环境变量（Docker 场景）。文件日志 `logs/reseed.log`（脱敏+按轮次裁剪，对齐 Python logger.py）。
 
-GUI 覆盖 CLI 全部功能：仪表盘可触发立即辅种 / 同步 Cookie / 死种检测 / 生成周报 / 演练模式开关（--dry-run 对应）；设置页四 Tab（下载器/站点/调度与全局/通知与集成）可编辑全部常用配置（飞书/CookieCloud/Jackett/日志/下载器行为开关），站点支持新增与删除。
+GUI 覆盖 CLI 全部功能：仪表盘可触发立即辅种 / 同步 Cookie / 死种检测 / 生成周报 / 演练模式开关（--dry-run 对应）；设置页四 Tab（下载器/站点/调度与全局/通知与集成）可编辑全部常用配置（飞书/CookieCloud/Jackett/日志/下载器行为开关），站点支持新增与删除。GUI 设计语言（theme.rs 石墨系）：无 emoji 图标、单一雾蓝强调色、背景明度分层（BG/SURFACE/INPUT_BG）、分隔线用 DIVIDER 不堆边框、Tab 下划线激活态、数据用等宽字体+排版层级表达、开关为哑光滑块组件（switch）。
 
 ## 技术栈
 
@@ -36,6 +36,6 @@ GUI 覆盖 CLI 全部功能：仪表盘可触发立即辅种 / 同步 Cookie / �
 
 ## 当前状态与下一步
 
-- 全部功能移植完成（三轮审计：轮二修 6 项缺陷、轮三补文件日志/weekly-report/SEEDHOUND_MODE/reseed 自动升级；GUI 轮：修 Tab 切换/布局/退出残留，补齐 CLI 功能 GUI 覆盖），76/76 测试，clippy 0 警告
+- 全部功能移植完成（三轮审计：轮二修 6 项缺陷、轮三补文件日志/weekly-report/SEEDHOUND_MODE/reseed 自动升级；GUI 轮：修 Tab 切换/布局/退出残留，补齐 CLI 功能 GUI 覆盖；审美轮：全 GUI 去模板味重做——石墨色板/下划线 Tab/滑块开关/无框卡片/等宽数据条，清理死代码 BORDER/LINK/SURFACE_HOVER/Dashboard 冗余字段），76/76 测试，clippy 0 警告
 - 已知遗留（见 AUDIT「遗留建议」）：站内批次并发 2+熔断、连接池上限调优、qB 5.x 真机验证、GUI 调度开关变更需重启生效
 - git：v0.1.0 已打 tag（提交身份 schalkiii@github.com）

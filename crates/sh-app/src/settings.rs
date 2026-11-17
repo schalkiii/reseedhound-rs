@@ -169,14 +169,13 @@ impl SettingsPage {
     ) -> AnyElement {
         div()
             .id(id)
-            .px_4().py_2()
-            .rounded_lg()
+            .px_3()
+            .pb_2()
             .text_sm()
-            .text_color(if active { rgb(0xffffff) } else { theme::TEXT_DIM })
-            .bg(if active { theme::BTN_PRIMARY } else { theme::SURFACE })
-            .border_1()
-            .border_color(if active { theme::BTN_PRIMARY } else { theme::BORDER })
-            .hover(|s| s.cursor_pointer().bg(theme::SURFACE_HOVER))
+            .text_color(if active { theme::TEXT } else { theme::TEXT_DIM })
+            .border_b_2()
+            .border_color(if active { theme::ACCENT } else { theme::TRANSPARENT })
+            .hover(|s| if active { s } else { s.cursor_pointer().text_color(theme::TEXT) })
             .child(label.to_string())
             .on_mouse_down(
                 MouseButton::Left,
@@ -186,6 +185,29 @@ impl SettingsPage {
                 }),
             )
             .into_any_element()
+    }
+
+    /// 开关轨道 + 滑块（哑光，无文字）。
+    fn switch(on: bool) -> Div {
+        let (track, knob) = if on {
+            (theme::ACCENT, theme::TEXT_ON_PRIMARY)
+        } else {
+            (theme::DISABLED, theme::TEXT_DIM)
+        };
+        let track_div = div()
+            .flex()
+            .flex_none()
+            .w(px(28.))
+            .h(px(16.))
+            .rounded_full()
+            .bg(track)
+            .items_center()
+            .px(px(2.));
+        if on {
+            track_div.child(div().ml_auto().w(px(12.)).h(px(12.)).rounded_full().bg(knob))
+        } else {
+            track_div.child(div().w(px(12.)).h(px(12.)).rounded_full().bg(knob))
+        }
     }
 
     fn toggle_row(
@@ -199,23 +221,17 @@ impl SettingsPage {
             .flex()
             .justify_between()
             .items_center()
+            .gap_4()
             .child(
                 div().flex().flex_col().gap_1()
                     .child(div().text_sm().text_color(theme::TEXT).child(label.to_string()))
-                    .child(div().text_xs().text_color(theme::TEXT_DIM).child(hint.to_string())),
+                    .child(div().text_xs().text_color(theme::TEXT_FAINT).child(hint.to_string())),
             )
             .child(
                 div()
                     .id(id)
-                    .px_3().py_1()
-                    .rounded_md()
-                    .text_xs()
-                    .bg(if on { theme::BTN_PRIMARY } else { theme::SURFACE })
-                    .border_1()
-                    .border_color(if on { theme::BTN_PRIMARY } else { theme::BORDER })
-                    .text_color(if on { rgb(0xffffff) } else { theme::TEXT_DIM })
                     .hover(|s| s.cursor_pointer())
-                    .child(if on { "已启用" } else { "已禁用" })
+                    .child(Self::switch(on))
                     .on_mouse_down(MouseButton::Left, handler),
             )
             .into_any_element()
@@ -348,12 +364,14 @@ impl Render for SettingsPage {
             .flex_1()
             .min_h_0()
             .w_full()
-            .gap_5()
-            // 标签栏
+            .gap_4()
+            // 标签栏（下划线激活态）
             .child(
                 div()
                     .flex()
-                    .gap_2()
+                    .gap_5()
+                    .border_b_1()
+                    .border_color(theme::DIVIDER)
                     .children(vec![
                         Self::tab_button("下载器", tab == Tab::Downloader, "tab-dl", Tab::Downloader, cx),
                         Self::tab_button("站点", tab == Tab::Sites, "tab-sites", Tab::Sites, cx),
@@ -366,17 +384,15 @@ impl Render for SettingsPage {
                 div()
                     .id("settings-scroll")
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap_4()
                     .child(
                         div()
-                            .p_6()
-                            .rounded_xl()
+                            .py_5()
+                            .rounded_lg()
                             .bg(theme::SURFACE)
-                            .border_1()
-                            .border_color(theme::BORDER)
                             .flex()
                             .flex_col()
                             .gap_4()
@@ -419,35 +435,31 @@ impl Render for SettingsPage {
                                         let (dot, color) = if enabled {
                                             ("●", theme::GREEN)
                                         } else {
-                                            ("○", theme::TEXT_DIM)
+                                            ("○", theme::TEXT_FAINT)
                                         };
                                         div()
                                             .flex()
                                             .flex_col()
-                                            .gap_2()
-                                            .p_4()
-                                            .rounded_lg()
+                                            .gap_3()
+                                            .px_5()
+                                            .py_4()
+                                            .rounded_md()
                                             .bg(theme::INPUT_BG)
-                                            .border_1()
-                                            .border_color(theme::BORDER)
                                             .child(
                                                 div().flex().justify_between().items_center()
                                                     .child(
-                                                        div().text_sm().text_color(color)
-                                                            .child(format!("{dot} 站点 #{}", idx + 1)),
+                                                        div().flex().items_center().gap_2()
+                                                            .child(div().text_xs().text_color(color).child(dot.to_string()))
+                                                            .child(div().text_sm().text_color(theme::TEXT_DIM).child(format!("站点 #{}", idx + 1))),
                                                     )
                                             .child(
                                                 div().flex().gap_2()
                                                     .child(
                                                         div()
                                                             .id(("site-toggle", idx))
-                                                            .px_3().py_1()
                                                             .rounded_md()
-                                                            .text_xs()
-                                                            .bg(if enabled { theme::BTN_PRIMARY } else { theme::SURFACE })
-                                                            .text_color(if enabled { rgb(0xffffff) } else { theme::TEXT_DIM })
                                                             .hover(|s| s.cursor_pointer())
-                                                            .child(if enabled { "已启用" } else { "已禁用" })
+                                                            .child(Self::switch(enabled))
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
                                                                 if let Some(r) = this.sites.get_mut(idx) {
                                                                     r.form.enabled = !r.form.enabled;
@@ -458,12 +470,12 @@ impl Render for SettingsPage {
                                                     .child(
                                                         div()
                                                             .id(("site-del", idx))
-                                                            .px_3().py_1()
+                                                            .px_2()
+                                                            .py_1()
                                                             .rounded_md()
                                                             .text_xs()
-                                                            .text_color(theme::RED)
-                                                            .border_1().border_color(rgb(0x7f1d1d))
-                                                            .hover(|s| s.cursor_pointer().bg(rgb(0x7f1d1d)))
+                                                            .text_color(theme::TEXT_FAINT)
+                                                            .hover(|s| s.cursor_pointer().text_color(theme::RED).bg(theme::BTN_GHOST_HOVER))
                                                             .child("删除")
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
                                                                 if this.sites.len() > idx {
@@ -480,16 +492,16 @@ impl Render for SettingsPage {
                                             .child(Self::field_row("Passkey", &row.passkey, None))
                                             .into_any_element()
                                     }).collect();
-                                    // 新增站点按钮
+                                    // 新增站点（ghost 文字按钮）
                                     rows.push(
                                         div()
                                             .id("site-add")
-                                            .px_4().py_2()
-                                            .rounded_lg()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
                                             .text_sm()
-                                            .text_color(theme::LINK)
-                                            .border_1().border_color(theme::BORDER)
-                                            .hover(|s| s.cursor_pointer().bg(theme::BTN_GHOST_HOVER))
+                                            .text_color(theme::TEXT_DIM)
+                                            .hover(|s| s.cursor_pointer().text_color(theme::TEXT).bg(theme::BTN_GHOST_HOVER))
                                             .child("+ 新增站点")
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _w, cx| {
                                                 let name = cx.new(|cx| TextInput::new(cx, "站点名", "", false));
@@ -506,67 +518,45 @@ impl Render for SettingsPage {
                                     rows
                                 }
                                 Tab::Scheduler => vec![
-                                    // 定时开关
-                                    div().flex().justify_between().items_center()
-                                        .child(div().flex().flex_col().gap_1()
-                                            .child(div().text_sm().text_color(theme::TEXT).child("启用定时调度"))
-                                            .child(div().text_xs().text_color(theme::TEXT_DIM).child("关闭时仅托盘/按钮手动触发辅种")))
-                                        .child(
-                                            div()
-                                                .id("sched-toggle")
-                                                .px_3().py_1()
-                                                .rounded_md()
-                                                .text_xs()
-                                                .bg(if self.sched_enabled { theme::BTN_PRIMARY } else { theme::SURFACE })
-                                                .text_color(if self.sched_enabled { rgb(0xffffff) } else { theme::TEXT_DIM })
-                                                .hover(|s| s.cursor_pointer())
-                                                .child(if self.sched_enabled { "已启用" } else { "已禁用" })
-                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _w, cx| {
-                                                    this.sched_enabled = !this.sched_enabled;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .into_any_element(),
+                                    Self::toggle_row(
+                                        "启用定时调度",
+                                        "关闭时仅托盘/按钮手动触发辅种",
+                                        self.sched_enabled,
+                                        "sched-toggle",
+                                        cx.listener(|this, _ev, _w, cx| {
+                                            this.sched_enabled = !this.sched_enabled;
+                                            cx.notify();
+                                        }),
+                                    ),
                                     Self::field_row("调度间隔（分钟）", &self.sched_interval, None),
-                                    // run_on_start 开关
-                                    div().flex().justify_between().items_center()
-                                        .child(div().flex().flex_col().gap_1()
-                                            .child(div().text_sm().text_color(theme::TEXT).child("启动即执行首轮"))
-                                            .child(div().text_xs().text_color(theme::TEXT_DIM).child("关闭则等待一个完整间隔后再跑")))
-                                        .child(
-                                            div()
-                                                .id("ros-toggle")
-                                                .px_3().py_1()
-                                                .rounded_md()
-                                                .text_xs()
-                                                .bg(if self.sched_run_on_start { theme::BTN_PRIMARY } else { theme::SURFACE })
-                                                .text_color(if self.sched_run_on_start { rgb(0xffffff) } else { theme::TEXT_DIM })
-                                                .hover(|s| s.cursor_pointer())
-                                                .child(if self.sched_run_on_start { "已启用" } else { "已禁用" })
-                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _w, cx| {
-                                                    this.sched_run_on_start = !this.sched_run_on_start;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .into_any_element(),
-                                    div().h_px().bg(theme::BORDER).into_any_element(),
+                                    Self::toggle_row(
+                                        "启动即执行首轮",
+                                        "关闭则等待一个完整间隔后再跑",
+                                        self.sched_run_on_start,
+                                        "ros-toggle",
+                                        cx.listener(|this, _ev, _w, cx| {
+                                            this.sched_run_on_start = !this.sched_run_on_start;
+                                            cx.notify();
+                                        }),
+                                    ),
+                                    div().h_px().bg(theme::DIVIDER).into_any_element(),
                                     Self::field_row("站点查询并发数", &self.glob_concurrency, None),
                                     Self::field_row("API 批量大小", &self.glob_batch, None),
                                     Self::field_row("辅种模式（pieces_hash / jackett / both）", &self.glob_mode, None),
-                                    div().h_px().bg(theme::BORDER).into_any_element(),
+                                    div().h_px().bg(theme::DIVIDER).into_any_element(),
                                     Self::field_row("日志级别（DEBUG / INFO / WARN / ERROR）", &self.log_level,
                                         Some("重启程序后生效")),
                                     Self::field_row("日志文件路径", &self.log_file, None),
                                 ],
                                 Tab::Notify => vec![
                                     // 飞书
-                                    div().text_sm().text_color(theme::TEXT).child("飞书通知").into_any_element(),
+                                    div().text_xs().text_color(theme::TEXT_FAINT).child("飞书通知").into_any_element(),
                                     Self::field_row("Webhook URL", &self.feishu_webhook,
                                         Some("留空则不推送")),
                                     Self::field_row("签名校验 Secret", &self.feishu_secret, None),
-                                    div().h_px().bg(theme::BORDER).into_any_element(),
+                                    div().h_px().bg(theme::DIVIDER).into_any_element(),
                                     // CookieCloud
-                                    div().text_sm().text_color(theme::TEXT).child("CookieCloud 同步").into_any_element(),
+                                    div().text_xs().text_color(theme::TEXT_FAINT).child("COOKIECLOUD 同步").into_any_element(),
                                     Self::toggle_row(
                                         "启用 CookieCloud",
                                         "每轮辅种开始前自动同步站点 Cookie",
@@ -580,9 +570,9 @@ impl Render for SettingsPage {
                                     Self::field_row("服务地址", &self.cc_url, None),
                                     Self::field_row("UUID", &self.cc_uuid, None),
                                     Self::field_row("解密密码", &self.cc_pass, None),
-                                    div().h_px().bg(theme::BORDER).into_any_element(),
+                                    div().h_px().bg(theme::DIVIDER).into_any_element(),
                                     // Jackett
-                                    div().text_sm().text_color(theme::TEXT).child("Jackett（jackett/both 模式）").into_any_element(),
+                                    div().text_xs().text_color(theme::TEXT_FAINT).child("JACKETT（jackett / both 模式）").into_any_element(),
                                     Self::toggle_row(
                                         "启用 Jackett",
                                         "辅种模式为 jackett / both 时生效",
@@ -609,19 +599,23 @@ impl Render for SettingsPage {
                     .flex()
                     .justify_between()
                     .items_center()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(theme::DIVIDER)
                     .children(status.map(|(msg, ok)| {
                         div()
                             .text_sm()
                             .text_color(if ok { theme::GREEN } else { theme::RED })
-                            .child(if ok { format!("✓ {msg}") } else { format!("⚠ {msg}") })
+                            .child(msg)
                     }))
                     .child(
                         div()
                             .id("settings-save")
-                            .px_6().py_2()
-                            .rounded_lg()
+                            .px_5()
+                            .py_1p5()
+                            .rounded_md()
                             .bg(theme::BTN_PRIMARY)
-                            .text_color(rgb(0xffffff))
+                            .text_color(theme::TEXT_ON_PRIMARY)
                             .text_sm()
                             .hover(|s| s.cursor_pointer().bg(theme::BTN_PRIMARY_HOVER))
                             .child("保存全部")

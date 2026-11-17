@@ -418,10 +418,10 @@ impl gpui::Element for TextElement {
         };
 
         let (display_text, text_color): (SharedString, gpui::Hsla) = if display_text.is_empty() {
-            // placeholder 用主题次要文本色（0x8b93a7），原 25% 白在深底上太暗
+            // placeholder 用最弱文字色（脚注层级，与正文拉开对比）
             (
                 input.placeholder.clone(),
-                crate::theme::TEXT_DIM.into(),
+                crate::theme::TEXT_FAINT.into(),
             )
         } else {
             (display_text, style.color)
@@ -461,7 +461,7 @@ impl gpui::Element for TextElement {
                         point(bounds.left() + line.x_for_index(selected_range.start), bounds.top()),
                         point(bounds.left() + line.x_for_index(selected_range.end), bounds.bottom()),
                     ),
-                    rgba(0x4c9eff40),
+                    rgba(0x6a9bd840),
                 )),
                 None,
             )
@@ -552,7 +552,7 @@ impl gpui::Render for TextInput {
             .rounded_md()
             .bg(crate::theme::INPUT_BG)
             .border_1()
-            .border_color(crate::theme::BORDER)
+            .border_color(crate::theme::DIVIDER)
             .child(TextElement { input: cx.entity() })
     }
 }
