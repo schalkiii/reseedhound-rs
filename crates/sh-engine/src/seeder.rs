@@ -758,6 +758,10 @@ impl ReseedEngine {
         let no_access_sites = Arc::new(Mutex::new(HashSet::new()));
         let site_serious_errors = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
         let site_timeout_errors = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        // 每站每轮下载上限（默认 50）：下载 .torrent 即消耗站点配额，超限熔断并提示
+        let download_limit = self.config.download_limit_per_site() as u64;
+        let site_download_counts = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+        let capped_sites = Arc::new(Mutex::new(HashSet::new()));
 
         // 下载器现有种子 info_hash 全量集合（增量去重 + 统计口径对齐 Python：
         // 已在下载器的种子直接记成功，不再发起 add 请求）
@@ -821,6 +825,8 @@ impl ReseedEngine {
                 .unwrap_or_default();
             let torrent_tag = torrent_tag.clone();
             let no_access = no_access_sites.clone();
+            let site_download_counts = site_download_counts.clone();
+            let capped_sites = capped_sites.clone();
             let serious = site_serious_errors.clone();
             let timeouts = site_timeout_errors.clone();
             let qb_existing = qb_existing_hashes.clone();
@@ -905,9 +911,31 @@ impl ReseedEngine {
                         }
                     };
 
+                    // 每站每轮下载上限：命中即熔断该站剩余匹配（首次触发时提示一次）
+                    {
+                        let counts = site_download_counts.lock().await;
+                        if counts.get(site_name).copied().unwrap_or(0) >= download_limit {
+                            drop(counts);
+                            let mut capped = capped_sites.lock().await;
+                            if capped.insert(site_name.clone()) {
+                                tracing::warn!(
+                                    "站点 {site_name} 本轮下载已达上限 ({download_limit})，跳过剩余匹配"
+                                );
+                            }
+                            continue;
+                        }
+                    }
                     let (data, reason) = client
                         .try_download(&dl_url, site_name, *torrent_id)
                         .await;
+                    // 计数只含真实发起的请求（死种缓存命中不消耗配额，不计）
+                    if reason != crate::site_client::DownloadReason::DeadCached {
+                        *site_download_counts
+                            .lock()
+                            .await
+                            .entry(site_name.clone())
+                            .or_insert(0) += 1;
+                    }
                     let Some(torrent_data) = data else {
                         let reason_s = reason_str(&reason);
                         if reason_s == "dead_cached" {

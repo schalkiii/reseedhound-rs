@@ -116,10 +116,6 @@ impl Render for RootView {
 }
 
 fn main() {
-    // GUI 常驻运行：日志写文件（logs/reseed.log），keep_runs=0 不裁剪，
-    // 远期清理由 weekly-report --clean 负责。windows_subsystem 下控制台不可见，
-    // 控制台层保留（RDP 调试时重定向可见）。
-    sh_core::log_setup::setup_logging("INFO", "logs/reseed.log", 0);
     install_panic_hook();
 
     // 双击运行时工作目录是 exe 所在目录，统一锚定到 exe 旁的 config.yaml / sites.yaml。
@@ -128,6 +124,10 @@ fn main() {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let _ = std::env::set_current_dir(&exe_dir);
+    // GUI 常驻运行：日志写文件（logs/reseed.log，随工作目录锚定 exe 旁），
+    // keep_runs=0 不裁剪，远期清理由 weekly-report --clean 负责。
+    // windows_subsystem 下控制台不可见，控制台层保留（RDP 调试时重定向可见）。
+    sh_core::log_setup::setup_logging("INFO", "logs/reseed.log", 0);
     let config_path = exe_dir.join("config.yaml");
     let sites_path = exe_dir.join("sites.yaml");
     let config_path_str = config_path.to_string_lossy().into_owned();
@@ -136,6 +136,13 @@ fn main() {
 
     // 共享状态 + 控制 channel
     let state = Arc::new(Mutex::new(RunState::default()));
+
+    // 日志跟随线程：把引擎日志（脱敏后写盘的 logs/reseed.log）实时带进 GUI
+    // 面板，并从进度行解析阶段 1/2/3 百分比（日志即数据源，显示口径一致）。
+    {
+        let st = state.clone();
+        std::thread::spawn(move || follow_log_file("logs/reseed.log", &st));
+    }
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
     let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (action_tx, action_rx) = tokio::sync::mpsc::channel::<dashboard::GuiAction>(1);
@@ -443,6 +450,9 @@ fn spawn_scheduler(
                         // 每轮开始重置终止标志（上一轮的终止请求不带到下一轮）
                         s.cancel_flag()
                             .store(false, std::sync::atomic::Ordering::Relaxed);
+                        s.progress_label.clear();
+                        s.progress_done = 0;
+                        s.progress_total = 0;
                         s.push_log(format!("[{cycle}] 开始辅种…"));
                     }
                 }) as Arc<dyn Fn(u64) + Send + Sync>
@@ -505,4 +515,84 @@ fn spawn_scheduler(
             }
         });
     })
+}
+
+/// 跟随日志文件：新行推入 GUI 日志面板，并解析阶段进度。
+///
+/// 日志即数据源——面板显示与文件记录口径一致（含脱敏），不额外接 tracing 管线。
+fn follow_log_file(path: &str, state: &Arc<Mutex<RunState>>) {
+    use std::io::{Read, Seek, SeekFrom};
+    // 从当前文件尾开始跟（历史行不补，面板随新轮次自然填充）
+    let mut offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let Ok(mut f) = std::fs::OpenOptions::new().read(true).open(path) else {
+            continue;
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < offset {
+            // 日志被裁剪/轮转：从头跟
+            offset = 0;
+        }
+        if len == offset {
+            continue;
+        }
+        if f.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            continue;
+        }
+        offset = len;
+        for line in buf.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            apply_progress_line(state, line);
+            if let Ok(mut s) = state.lock() {
+                s.push_log(line.to_string());
+            }
+        }
+    }
+}
+
+/// 从进度日志行解析 (标签, 完成, 总数)。行样例：
+/// `[阶段1] 解析进度 5000/41903（缓存命中 0）`、`[阶段2] 站点进度 1/65 · 站点名`、
+/// `[阶段3] 进度 50/4248 颗种子`
+fn apply_progress_line(state: &Arc<Mutex<RunState>>, line: &str) {
+    const MARKERS: [(&str, &str); 3] = [
+        ("[阶段1] 解析进度 ", "阶段1 解析"),
+        ("[阶段2] 站点进度 ", "阶段2 查询"),
+        ("[阶段3] 进度 ", "阶段3 添加"),
+    ];
+    for (marker, label) in MARKERS {
+        let Some(pos) = line.find(marker) else {
+            continue;
+        };
+        let rest = &line[pos + marker.len()..];
+        let mut parts = rest.split('/');
+        let (Some(done_s), Some(total_s)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let done = leading_u64(done_s);
+        let total = leading_u64(total_s);
+        if total > 0 {
+            if let Ok(mut s) = state.lock() {
+                s.progress_label = label.to_string();
+                s.progress_done = done;
+                s.progress_total = total;
+            }
+        }
+        return;
+    }
+}
+
+/// 取字符串前导数字（进度行尾部带「（缓存命中 N）」「颗种子」等后缀）。
+fn leading_u64(s: &str) -> u64 {
+    s.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
 }

@@ -23,6 +23,7 @@ pub mod defaults {
     pub const GLOBAL_RETRY_COUNT: u32 = 2;
     pub const GLOBAL_RETRY_DELAY: f64 = 2.0;
     pub const GLOBAL_MODE: &str = "pieces_hash";
+    pub const GLOBAL_DOWNLOAD_LIMIT_PER_SITE: usize = 50;
     pub const DB_PATH: &str = "data/cache.db";
     pub const LOG_LEVEL: &str = "INFO";
     pub const LOG_FILE: &str = "logs/reseed.log";
@@ -65,6 +66,8 @@ pub struct GlobalSection {
     pub retry_count: Option<u32>,
     pub retry_delay: Option<f64>,
     pub mode: Option<String>,
+    /// 每站每轮下载上限（下载 .torrent 即消耗站点配额，超限熔断）
+    pub download_limit_per_site: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -202,7 +205,8 @@ pub struct SitesFile {
 fn known_keys(section: &str) -> Option<&'static [&'static str]> {
     Some(match section {
         "global" => &["concurrency", "batch_size", "api_timeout", "download_timeout",
-            "download_interval", "retry_count", "retry_delay", "mode"],
+            "download_interval", "retry_count", "retry_delay", "mode",
+            "download_limit_per_site"],
         "db" => &["path"],
         "log" => &["level", "file"],
         "scheduler" => &["enabled", "interval_minutes", "startup_delay", "run_on_start"],
@@ -385,6 +389,13 @@ impl Config {
     pub fn override_mode(&mut self, mode: &str) {
         let g = self.file.global.get_or_insert_with(Default::default);
         g.mode = Some(mode.to_string());
+    }
+
+    /// 每站每轮下载上限（默认 50）：历史缺失/海量匹配时防止单轮打爆站点小时配额
+    pub fn download_limit_per_site(&self) -> usize {
+        self.global()
+            .download_limit_per_site
+            .unwrap_or(defaults::GLOBAL_DOWNLOAD_LIMIT_PER_SITE)
     }
 
     pub fn db_path(&self) -> String {
@@ -660,6 +671,7 @@ static EMPTY_GLOBAL: GlobalSection = GlobalSection {
     retry_count: None,
     retry_delay: None,
     mode: None,
+    download_limit_per_site: None,
 };
 
 static EMPTY_DOWNLOADER: DownloaderSection = DownloaderSection {

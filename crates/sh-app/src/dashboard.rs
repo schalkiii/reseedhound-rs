@@ -37,6 +37,10 @@ pub struct RunState {
     pub action_result: String,
     /// 工具动作是否正在执行。
     pub action_running: bool,
+    /// 流水线进度（由日志行驱动，GUI 进度条显示）
+    pub progress_label: String,
+    pub progress_done: u64,
+    pub progress_total: u64,
     /// 本轮站点范围（空 = 全部）。GUI 选择后由调度器 options_provider 注入 `--site`，
     /// 每轮结束由 on_report 清空——只影响下一轮，定时轮次仍跑全部站点。
     pub selected_sites: Vec<String>,
@@ -54,7 +58,7 @@ impl RunState {
 
     pub fn push_log(&mut self, line: String) {
         self.log_lines.push(line);
-        if self.log_lines.len() > 200 {
+        if self.log_lines.len() > 400 {
             self.log_lines.remove(0);
         }
     }
@@ -341,6 +345,46 @@ impl Render for Dashboard {
                         Self::stat("上次运行", s.last_run.clone(), theme::TEXT_DIM)
                     }),
             )
+            // 流水线进度条（阶段1/2/3，由日志行驱动）
+            .child(if s.progress_total > 0 {
+                let frac = (s.progress_done as f32 / s.progress_total.max(1) as f32).min(1.0);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .text_xs()
+                            .text_color(theme::TEXT_DIM)
+                            .child(s.progress_label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(6.))
+                            .rounded_full()
+                            .bg(theme::SURFACE)
+                            .child(
+                                div()
+                                    .w(relative(frac))
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(theme::ACCENT),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::TEXT_DIM)
+                            .font_family("Consolas")
+                            .child(format!("{}/{}", s.progress_done, s.progress_total)),
+                    )
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             // 主区：左站点明细 / 右日志
             .child(
                 div()
@@ -547,7 +591,7 @@ impl Render for Dashboard {
                                     this.request_action(GuiAction::SyncCookies);
                                 },
                             )))
-                            .child(Self::tool_button("死种检测", "act-check-dead", cx.listener(
+                            .child(Self::tool_button("死站检测", "act-check-dead", cx.listener(
                                 |this, _ev, _w, _cx| {
                                     this.request_action(GuiAction::CheckDead);
                                 },
