@@ -18,6 +18,8 @@ pub struct ReseedStats {
     pub failed_count: u64,
     pub dead_count: u64,
     pub skipped_count: u64,
+    /// 目标种子已在下载器（下载 .torrent 后才发现）：跳过添加，避免统计上"消失"
+    pub already_in_downloader: u64,
     pub site_details: HashMap<String, u64>,
     pub site_match_counts: HashMap<String, u64>,
     pub site_succeeded: HashMap<String, u64>,

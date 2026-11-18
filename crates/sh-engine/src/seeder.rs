@@ -351,10 +351,11 @@ impl ReseedEngine {
         stats.dead_count = self.dead_cache.size().await as u64;
         tracing::info!("{}", "=".repeat(60));
         tracing::info!(
-            "辅种完成: 扫描={}, 去重={}, 新={}, 匹配={}, 追踪器跳过={}, 成功={}, 失败={}, 死种={}, 耗时={}",
+            "辅种完成: 扫描={}, 去重={}, 新={}, 匹配={}, 追踪器跳过={}, 成功={}, 失败={}, 已在下载器={}, 跳过={}, 死种={}, 耗时={}",
             stats.total_torrents, stats.duplicate_count, stats.new_torrents,
             stats.matched_count, stats.tracker_skip_count, stats.succeeded_count,
-            stats.failed_count, stats.dead_count, stats.duration_str()
+            stats.failed_count, stats.already_in_downloader, stats.skipped_count,
+            stats.dead_count, stats.duration_str()
         );
         tracing::info!("{}", "=".repeat(60));
         Ok(stats)
@@ -830,12 +831,13 @@ impl ReseedEngine {
 
             handles.push(tokio::spawn(async move {
                 if is_cancelled(&cancel) {
-                    return (0, HashMap::new(), HashMap::new(), false);
+                    return (0, HashMap::new(), HashMap::new(), false, 0);
                 }
                 let mut piece_failed = 0u64;
                 let mut piece_failed_by_site: HashMap<String, u64> = HashMap::new();
                 let mut credential_failures: HashMap<String, String> = HashMap::new();
                 let mut skipped = false;
+                let mut already = 0u64;
                 let mut source_save_path: Option<String> = None;
 
                 // 源种子状态前置检查（对齐 Python get_torrent_info）：
@@ -967,8 +969,11 @@ impl ReseedEngine {
                     // 并写入辅种记录，跳过下载器 add 请求（双方均为小写 hex）
                     if qb_existing.contains(&parsed.info_hash) {
                         let _ = cache.add_reseed_record(&entry.pieces_hash, site_name, *torrent_id);
-                        tracing::debug!(
-                            "已在下载器: {} -> {site_name} (id={torrent_id})，记成功",
+                        // INFO 级可见：此前只打 debug，表现为「配额消耗了、qB 没新增、
+                        // 成功失败都是 0」——实际是目标种子已在下载器，跳过添加
+                        already += 1;
+                        tracing::info!(
+                            "已在下载器: {} -> {site_name} (id={torrent_id})，跳过添加",
                             entry.file_name
                         );
                         continue;
@@ -987,27 +992,45 @@ impl ReseedEngine {
                             source_save_path.as_deref(),
                         )
                         .await;
-                    if result {
-                        let _ = cache.add_reseed_record(&entry.pieces_hash, site_name, *torrent_id);
-                        tracing::info!(
-                            "辅种成功: {} -> {site_name} (id={torrent_id})",
-                            entry.file_name
-                        );
-                    } else {
-                        // 下载 .torrent 已消耗站点下载配额，添加失败必须显式记录，
-                        // 否则表现为「配额被消耗但 qB 里没有」却无从追查
-                        tracing::warn!(
-                            "添加失败（已消耗 {site_name} 下载配额）: {} (id={torrent_id}, save_path={:?})",
-                            entry.file_name,
-                            source_save_path,
-                        );
-                        piece_failed += 1;
-                        *piece_failed_by_site.entry(site_name.clone()).or_insert(0) += 1;
+                    match result {
+                        crate::downloader::AddOutcome::Success => {
+                            let _ = cache.add_reseed_record(&entry.pieces_hash, site_name, *torrent_id);
+                            tracing::info!(
+                                "辅种成功: {} -> {site_name} (id={torrent_id})",
+                                entry.file_name
+                            );
+                        }
+                        crate::downloader::AddOutcome::Duplicate => {
+                            // 目标已在下载器（qB 409/幂等命中）：良性终态，配额已消耗但不算失败
+                            already += 1;
+                            let _ = cache.add_reseed_record(&entry.pieces_hash, site_name, *torrent_id);
+                            tracing::info!(
+                                "已在下载器: {} -> {site_name} (id={torrent_id})，跳过添加",
+                                entry.file_name
+                            );
+                        }
+                        crate::downloader::AddOutcome::Failed => {
+                            // 下载 .torrent 已消耗站点下载配额，添加失败必须显式记录，
+                            // 否则表现为「配额被消耗但 qB 里没有」却无从追查
+                            tracing::warn!(
+                                "添加失败（已消耗 {site_name} 下载配额）: {} (id={torrent_id}, save_path={:?})",
+                                entry.file_name,
+                                source_save_path,
+                            );
+                            piece_failed += 1;
+                            *piece_failed_by_site.entry(site_name.clone()).or_insert(0) += 1;
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs_f64(0.3)).await;
                 }
 
-                (piece_failed, piece_failed_by_site, credential_failures, skipped)
+                (
+                    piece_failed,
+                    piece_failed_by_site,
+                    credential_failures,
+                    skipped,
+                    already,
+                )
             }));
             drop(permit);
         }
@@ -1015,10 +1038,11 @@ impl ReseedEngine {
         let total_entries = handles.len();
         let mut entries_done = 0usize;
         for h in handles {
-            if let Ok((failed, by_site, creds, skipped)) = h.await {
+            if let Ok((failed, by_site, creds, skipped, already)) = h.await {
                 if skipped {
                     stats.skipped_count += 1;
                 }
+                stats.already_in_downloader += already;
                 stats.failed_count += failed;
                 for (site, cnt) in by_site {
                     *stats.site_failed.entry(site).or_insert(0) += cnt;
@@ -1116,7 +1140,7 @@ impl ReseedEngine {
                     .await
                     .map(|(path, _)| path)
                     .filter(|p| !p.is_empty());
-                let ok = d
+                let outcome = d
                     .add_torrent_bytes(
                         &torrent_data,
                         false,
@@ -1126,13 +1150,20 @@ impl ReseedEngine {
                         source_save_path.as_deref(),
                     )
                     .await;
-                if ok {
-                    stats.succeeded_count += 1;
-                    *stats.site_succeeded.entry(indexer.clone()).or_insert(0) += 1;
-                    *stats.site_details.entry(indexer.clone()).or_insert(0) += 1;
-                    stats.matched_count += 1;
-                } else {
-                    stats.failed_count += 1;
+                match outcome {
+                    crate::downloader::AddOutcome::Success => {
+                        stats.succeeded_count += 1;
+                        *stats.site_succeeded.entry(indexer.clone()).or_insert(0) += 1;
+                        *stats.site_details.entry(indexer.clone()).or_insert(0) += 1;
+                        stats.matched_count += 1;
+                    }
+                    crate::downloader::AddOutcome::Duplicate => {
+                        stats.already_in_downloader += 1;
+                        stats.matched_count += 1;
+                    }
+                    crate::downloader::AddOutcome::Failed => {
+                        stats.failed_count += 1;
+                    }
                 }
             }
         }

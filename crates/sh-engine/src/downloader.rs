@@ -52,6 +52,20 @@ pub struct AddResult {
     pub info_hashes: Vec<String>,
 }
 
+/// `torrents/add` 结果分类。
+///
+/// qB 5.2+ 对「目标已存在」返回 409 Conflict（实测 qB 5.3.0），与真实失败
+/// 混计会让重复辅种表现为「失败 N 且配额被消耗」。重复是良性终态，单独归类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// 新增成功
+    Success,
+    /// 目标已在下载器（qB 409 / 幂等预检命中 / Transmission torrent-duplicate）
+    Duplicate,
+    /// 真实失败
+    Failed,
+}
+
 /// 判定 `torrents/add` 是否被 qB 受理（对齐 Python `_is_add_success`）。
 ///
 /// qB 的返回体随版本而变：WebAPI v2.14.0（qB 5.2）起是 JSON 计数
@@ -147,17 +161,17 @@ impl DownloaderClient {
         tag: Option<&str>,
         info_hash: &str,
         save_path: Option<&str>,
-    ) -> bool {
+    ) -> AddOutcome {
         match self.conn.kind {
             DownloaderKind::Qbittorrent => {
-                // 幂等：已存在则视为成功
+                // 幂等：已存在 -> Duplicate（不算新增成功）
                 if let Some(state) = self.qb_torrent_status(info_hash).await {
                     if state == "pausedUP" || state == "stoppedUP" || state == "uploading" {
-                        return true;
+                        return AddOutcome::Duplicate;
                     }
                 }
                 if self.qb_session.is_none() && self.qb_login().await.is_err() {
-                    return false;
+                    return AddOutcome::Failed;
                 }
                 let url = format!("{}/api/v2/torrents/add", self.base_url());
                 let mut form = reqwest::multipart::Form::new().part(
@@ -188,10 +202,22 @@ impl DownloaderClient {
                 match req.send().await {
                     Ok(r) => {
                         let status = r.status();
+                        // 409 Conflict = 目标已存在（qB 5.3.0 实测），归 Duplicate
+                        if status == reqwest::StatusCode::CONFLICT {
+                            return AddOutcome::Duplicate;
+                        }
                         let body = r.text().await.unwrap_or_default();
-                        is_qb_add_success(status, &body)
+                        if is_qb_add_success(status, &body) {
+                            AddOutcome::Success
+                        } else {
+                            tracing::debug!(
+                                "qB add 未受理: HTTP {status}, body={:.120}",
+                                body.trim()
+                            );
+                            AddOutcome::Failed
+                        }
                     }
-                    Err(_) => false,
+                    Err(_) => AddOutcome::Failed,
                 }
             }
             DownloaderKind::Transmission => {
@@ -206,7 +232,7 @@ impl DownloaderClient {
                 });
                 let url = format!("{}/transmission/rpc", self.base_url());
                 let Ok(session_id) = self.tr_session_id().await else {
-                    return false;
+                    return AddOutcome::Failed;
                 };
                 match self
                     .http
@@ -217,10 +243,14 @@ impl DownloaderClient {
                     .await
                 {
                     Ok(r) => match r.json::<Value>().await {
-                        Ok(v) => v.get("result").and_then(|r| r.as_str()) == Some("success"),
-                        Err(_) => false,
+                        Ok(v) => match v.get("result").and_then(|r| r.as_str()) {
+                            Some("success") => AddOutcome::Success,
+                            Some("torrent-duplicate") => AddOutcome::Duplicate,
+                            _ => AddOutcome::Failed,
+                        },
+                        Err(_) => AddOutcome::Failed,
                     },
-                    Err(_) => false,
+                    Err(_) => AddOutcome::Failed,
                 }
             }
         }
