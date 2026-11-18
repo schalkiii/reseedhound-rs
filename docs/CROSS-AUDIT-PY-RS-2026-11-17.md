@@ -20,6 +20,12 @@
 | 阶段2/3 无进度日志 | Rust 已有 `[阶段1] 解析进度 n/total`、`[阶段2] 站点进度 n/total`、`[阶段3] 进度 n/total` | `seeder.py` 同口径补齐（阶段2 每站点完成一行、阶段3 每 50 颗） |
 | add 失败静默 | Rust 补过「添加失败（已消耗 XX 下载配额）」warn | `seeder.py` 同口径补齐（此前只在 downloader 层有零散 warning） |
 
+## 2.5 Python → Rust 补录（2026-11-18 核实）
+
+| 缺口 | Python 依据 | Rust 修补 |
+|---|---|---|
+| 站点 Cookie 未注入请求（site_cookies 收集后成死数据，CF/登录保护站查询 403；实测 1ptba 带 cookie 200） | aiohttp cookie_jar 按域注入，全请求携带 | `site_client::site_cookie_for` 注入 get_bytes/post_json |
+
 ## 3. 两边一致、无需修改（已确认）
 
 - **CookieCloud 口令派生**：Python 一直是 `md5(uuid+'-'+password).hexdigest()[:16]`（正确），
