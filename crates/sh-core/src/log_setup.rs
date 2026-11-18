@@ -71,15 +71,31 @@ fn event_message(event: &tracing::Event<'_>) -> String {
     buffer.trim().to_string()
 }
 
+/// 依赖噪声过滤：本机未装「图形工具」可选功能（Graphics Tools）时，
+/// GPUI debug 构建查询 DXGIGetDebugInterface1 必然返回
+/// DXGI_ERROR_SDK_COMPONENT_MISSING（0x887A002D），windows-rs 会先打一条
+/// ERROR（HRESULT Debug 输出）再由 gpui 打一条 WARN。二者对运行零影响
+/// （调试层不可用而已），过滤避免每轮启动污染日志；安装图形工具后错误
+/// 自然消失，此过滤对已安装机器无副作用。
+fn is_dependency_noise(message: &str) -> bool {
+    message.starts_with("Error { code: HRESULT(0x887A002D)")
+        || message.contains("Failed to get DXGI debug interface")
+}
+
 /// 输出行：`2026-11-16 10:00:00 [INFO] 脱敏后的消息`。
-fn format_log_line(event: &tracing::Event<'_>) -> String {
+/// 返回 None 表示该事件是依赖噪声（两端输出层同步跳过）。
+fn format_log_line(event: &tracing::Event<'_>) -> Option<String> {
+    let message = event_message(event);
+    if is_dependency_noise(&message) {
+        return None;
+    }
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    format!(
+    Some(format!(
         "{} [{}] {}\n",
         timestamp,
         event.metadata().level(),
-        redact_secrets(&event_message(event))
-    )
+        redact_secrets(&message)
+    ))
 }
 
 /// 控制台输出层（stdout，与 Python StreamHandler 一致）。
@@ -87,7 +103,9 @@ struct RedactConsoleLayer;
 
 impl<S: tracing::Subscriber> Layer<S> for RedactConsoleLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let line = format_log_line(event);
+        let Some(line) = format_log_line(event) else {
+            return;
+        };
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
         let _ = handle.write_all(line.as_bytes());
@@ -110,7 +128,9 @@ impl RedactFileLayer {
 
 impl<S: tracing::Subscriber> Layer<S> for RedactFileLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let line = format_log_line(event);
+        let Some(line) = format_log_line(event) else {
+            return;
+        };
         if let Ok(mut file) = self.file.lock() {
             let _ = file.write_all(line.as_bytes());
         }
@@ -154,6 +174,22 @@ pub fn setup_logging(level: &str, log_file: &str, keep_runs: i64) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn dependency_noise_filtered_precisely() {
+        // 未装「图形工具」时 GPUI debug 构建的两条无害诊断
+        assert!(is_dependency_noise(
+            "Error { code: HRESULT(0x887A002D), message: \"sdk missing\" }"
+        ));
+        assert!(is_dependency_noise(
+            "Failed to get DXGI debug interface. DirectX debugging features will be disabled."
+        ));
+        // 其他 HRESULT 与正常消息不得误杀
+        assert!(!is_dependency_noise(
+            "Error { code: HRESULT(0x80070005), message: \"access denied\" }"
+        ));
+        assert!(!is_dependency_noise("辅种成功: foo.torrent -> 麒麟 (id=1)"));
+    }
 
     /// 每个测试独占的临时文件路径（无 tempfile 依赖，用进程内计数器保证唯一）。
     fn temp_log(name: &str) -> PathBuf {
