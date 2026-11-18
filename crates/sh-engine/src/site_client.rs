@@ -364,6 +364,24 @@ impl SiteClient {
         }
     }
 
+    /// 按 URL host 查找站点 Cookie（sites.yaml cookie/cookies）。
+    ///
+    /// Python 版把站点 cookie 按域注入 aiohttp cookie_jar，所有请求自动携带；
+    /// Rust 移植初期只收集未注入，导致 CF/登录保护的站点查询 403
+    /// （实测 1ptba：无 cookie 403、带 cookie 200）。
+    fn site_cookie_for(&self, url: &str) -> Option<String> {
+        let host = url::Url::parse(url).ok()?.host_str()?.to_string();
+        self.config.site_cookies.iter().find_map(|(site_url, cookie)| {
+            let site_url = url::Url::parse(site_url).ok()?;
+            let site_host = site_url.host_str()?;
+            if site_host == host {
+                Some(cookie.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// 检测到限流后放大该 host 的 backoff（对齐 Python：limit_delay / host_interval）。
     async fn bump_host_backoff(&self, url: &str, limit_delay: f64) {
         let host = match url::Url::parse(url) {
@@ -403,7 +421,11 @@ impl SiteClient {
             Err(_) => return (None, DownloadReason::ConnectionError),
         };
 
-        let resp = match self.download_http.get(url).send().await {
+        let mut dl_req = self.download_http.get(url);
+        if let Some(ck) = self.site_cookie_for(url) {
+            dl_req = dl_req.header(reqwest::header::COOKIE, ck);
+        }
+        let resp = match dl_req.send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("下载错误 {url}: {e}");
@@ -550,6 +572,9 @@ impl SiteClient {
                 if let Some(h) = headers {
                     req = req.headers(h.clone());
                 }
+                if let Some(ck) = self.site_cookie_for(url) {
+                    req = req.header(reqwest::header::COOKIE, ck);
+                }
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
@@ -625,6 +650,22 @@ impl SiteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_cookie_matches_by_host() {
+        let mut cfg = SiteClientConfig::default();
+        cfg.site_cookies.insert(
+            "https://1ptba.com".to_string(),
+            "c_secure_uid=abc; c_secure_pass=def".to_string(),
+        );
+        let client = SiteClient::new(cfg, Arc::new(DeadTorrentCache::new())).unwrap();
+        assert_eq!(
+            client.site_cookie_for("https://1ptba.com/api/pieces-hash").as_deref(),
+            Some("c_secure_uid=abc; c_secure_pass=def")
+        );
+        // 子域 / 其他站不误配
+        assert_eq!(client.site_cookie_for("https://api.piggo.me/api/pieces-hash"), None);
+    }
 
     #[test]
     fn html_reason_detection_matches_python_matrix() {
