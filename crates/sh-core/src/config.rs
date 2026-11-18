@@ -276,6 +276,9 @@ pub struct Config {
     pub sites_path: PathBuf,
     /// 准入过滤后的启用站点
     pub sites: Vec<SiteEntry>,
+    /// config.yaml 所在目录：db.path / log.file 等相对路径以此为锚，
+    /// 避免「换个工作目录启动 exe → 新建空 cache.db → 辅种历史丢失」
+    base_dir: PathBuf,
 }
 
 impl Config {
@@ -313,11 +316,30 @@ impl Config {
         let sites_file: SitesFile = serde_yaml::from_value(raw_sites)?;
         let sites = filter_enabled_sites(sites_file.sites);
 
+        let base_dir = Path::new(config_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
         Ok(Self {
             file,
             sites_path: PathBuf::from(sites_path),
             sites,
+            base_dir,
         })
+    }
+
+    /// 相对路径以 config.yaml 所在目录为锚；绝对路径原样返回。
+    fn resolve_path(&self, raw: &str) -> String {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            raw.to_string()
+        } else {
+            self.base_dir
+                .join(path)
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 
     /// 重新加载 sites.yaml（CookieCloud 同步写回后调用，使本轮引擎使用最新 Cookie）。
@@ -366,11 +388,13 @@ impl Config {
     }
 
     pub fn db_path(&self) -> String {
-        self.file
+        let raw = self
+            .file
             .db
             .as_ref()
             .and_then(|d| d.path.clone())
-            .unwrap_or_else(|| defaults::DB_PATH.to_string())
+            .unwrap_or_else(|| defaults::DB_PATH.to_string());
+        self.resolve_path(&raw)
     }
 
     pub fn log_level(&self) -> String {
@@ -381,11 +405,13 @@ impl Config {
             .unwrap_or_else(|| defaults::LOG_LEVEL.to_string())
     }
     pub fn log_file(&self) -> String {
-        self.file
+        let raw = self
+            .file
             .log
             .as_ref()
             .and_then(|l| l.file.clone())
-            .unwrap_or_else(|| defaults::LOG_FILE.to_string())
+            .unwrap_or_else(|| defaults::LOG_FILE.to_string());
+        self.resolve_path(&raw)
     }
 
     // scheduler
